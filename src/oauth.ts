@@ -23,7 +23,9 @@ export function getQoderPatForMode(mode: string, providerID = "qoder"): string {
     return process.env.QODERCN_API_KEY || process.env.QODERCN_PERSONAL_ACCESS_TOKEN || process.env.QODERCN_PAT || "";
   }
 
-  const suffix = providerID === "qoder-2" ? "_2" : "";
+  const accountMatch = /^qoder-(\d+)$/.exec(providerID);
+  const accountNumber = accountMatch ? Number(accountMatch[1]) : 1;
+  const suffix = accountNumber > 1 ? `_${accountNumber}` : "";
   return (
     process.env[`QODER_API_KEY${suffix}`] ||
     process.env[`QODER_PERSONAL_ACCESS_TOKEN${suffix}`] ||
@@ -142,6 +144,7 @@ async function loginQoderForMode(
   callbacks: OAuthLoginCallbacks,
   mode: string,
   providerID = isQoderCNMode(mode) ? "qoder-cn" : "qoder",
+  onLogin?: (providerID: string) => void,
 ): Promise<OAuthCredentials> {
   // 1. Try environment variables first (PAT). A PAT (pt-...) must be exchanged
   //    for a short-lived job token before it can be used — credentialsFromPat
@@ -159,6 +162,9 @@ async function loginQoderForMode(
       // without this the chat COSY payload would fall back to uid "qoder-user"
       // and Qoder CN rejects it with "Login expired" (105).
       saveCredentialsToAuthFile(providerID, creds);
+      try {
+        onLogin?.(providerID);
+      } catch {}
       return creds;
     } catch {
       // Fall through to interactive login if PAT exchange fails.
@@ -176,7 +182,19 @@ async function loginQoderForMode(
 
   // Persist the resolved identity locally (see note above).
   saveCredentialsToAuthFile(providerID, creds);
+  try {
+    onLogin?.(providerID);
+  } catch {}
   return creds;
+}
+
+export async function loginQoderForProvider(
+  callbacks: OAuthLoginCallbacks,
+  providerID: string,
+  mode: string,
+  onLogin?: (providerID: string) => void,
+): Promise<OAuthCredentials> {
+  return loginQoderForMode(callbacks, mode, providerID, onLogin);
 }
 
 export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {

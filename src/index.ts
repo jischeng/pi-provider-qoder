@@ -11,9 +11,8 @@ import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQode
 import {
   autoLoginQoderFromEnvironment,
   getCachedCredentials,
-  loginQoder,
-  loginQoder2,
   loginQoderCN,
+  loginQoderForProvider,
   refreshQoderToken,
   refreshQoderTokenCN,
 } from "./oauth.js";
@@ -25,6 +24,15 @@ import { fetchQoderUsage, fetchQoderUsageCN } from "./usage.js";
 type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
   fetchUsage: (credentials: OAuthCredentials) => Promise<unknown>;
 };
+
+type AccountLoginHandler = (providerID: string) => void;
+
+const MAX_GLOBAL_QODER_ACCOUNTS = 10;
+const registeredGlobalProviderIDs = new Set<string>();
+
+function globalProviderID(accountNumber: number): string {
+  return accountNumber === 1 ? "qoder" : `qoder-${accountNumber}`;
+}
 
 function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   const cached = getCachedModels(mode);
@@ -40,15 +48,14 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   }) as unknown as Model<Api>[];
 }
 
-function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsage {
-  const isSecondGlobalAccount = providerID === "qoder-2";
+function createQoderOAuth(providerID: string, mode: string, onLogin?: AccountLoginHandler): OAuthConfigWithUsage {
+  const accountNumber = providerID === "qoder" ? 1 : Number(providerID.replace("qoder-", ""));
+  const accountLabel = Number.isInteger(accountNumber) && accountNumber > 1 ? `Account ${accountNumber}` : "Account 1";
   return {
-    name: isQoderCNMode(mode)
-      ? "Qoder CN (PAT)"
-      : isSecondGlobalAccount
-        ? "Qoder Account 2 (Browser OAuth / PAT)"
-        : "Qoder Account 1 (Browser OAuth / PAT)",
-    login: isQoderCNMode(mode) ? loginQoderCN : isSecondGlobalAccount ? loginQoder2 : loginQoder,
+    name: isQoderCNMode(mode) ? "Qoder CN (PAT)" : `Qoder ${accountLabel} (Browser OAuth / PAT)`,
+    login: isQoderCNMode(mode)
+      ? loginQoderCN
+      : (callbacks) => loginQoderForProvider(callbacks, providerID, mode, onLogin),
     refreshToken: isQoderCNMode(mode) ? refreshQoderTokenCN : refreshQoderToken,
     getApiKey: (cred: OAuthCredentials) => cred.access,
     // NOTE: no `modifyModels` hook on purpose. OMP (Bun) does a whole-catalog
@@ -60,15 +67,49 @@ function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsag
   };
 }
 
-function registerQoderProvider(pi: ExtensionAPI, providerID: string, mode: string): void {
-  const oauth = createQoderOAuth(providerID, mode);
+function registerQoderProvider(
+  pi: ExtensionAPI,
+  providerID: string,
+  mode: string,
+  onLogin?: AccountLoginHandler,
+): void {
+  const oauth = createQoderOAuth(providerID, mode, onLogin);
   pi.registerProvider(providerID, {
-    name: providerID === "qoder-2" ? "Qoder (Account 2)" : providerID === "qoder" ? "Qoder (Account 1)" : "Qoder CN",
+    name:
+      providerID === "qoder-cn"
+        ? "Qoder CN"
+        : providerID === "qoder"
+          ? "Qoder (Account 1)"
+          : `Qoder (Account ${providerID.replace("qoder-", "")})`,
     baseUrl: getQoderBaseUrl(mode),
     api: "qoder-api" as Api,
     models: modelsForProvider(mode, providerID) as unknown as ProviderConfig["models"],
     oauth: oauth as ProviderConfig["oauth"],
     streamSimple: streamQoder,
+  });
+}
+
+function registerNextGlobalProvider(pi: ExtensionAPI, accountNumber: number, mode: string): void {
+  if (accountNumber > MAX_GLOBAL_QODER_ACCOUNTS) return;
+
+  const providerID = globalProviderID(accountNumber);
+  const previousProviderID = globalProviderID(accountNumber - 1);
+  if (registeredGlobalProviderIDs.has(providerID)) return;
+  if (!getCachedCredentials("", previousProviderID)?.access) return;
+
+  registeredGlobalProviderIDs.add(providerID);
+  registerQoderProvider(pi, providerID, mode, () => {
+    registerNextGlobalProvider(pi, accountNumber + 1, mode);
+  });
+}
+
+function registerGlobalProvider(pi: ExtensionAPI, accountNumber: number, mode: string): void {
+  const providerID = globalProviderID(accountNumber);
+  if (registeredGlobalProviderIDs.has(providerID)) return;
+
+  registeredGlobalProviderIDs.add(providerID);
+  registerQoderProvider(pi, providerID, mode, () => {
+    registerNextGlobalProvider(pi, accountNumber + 1, mode);
   });
 }
 
@@ -88,18 +129,32 @@ async function refreshModelsAtStartup(providerID: string, mode: string): Promise
 }
 
 export default async function (pi: ExtensionAPI) {
-  for (const [providerID, mode] of [
-    ["qoder", getQoderMode()],
-    ["qoder-2", getQoderMode()],
-    ["qoder-cn", "cn"],
-  ] as const) {
+  const globalMode = getQoderMode();
+
+  // Only expose the next account slot after the previous slot is already
+  // authenticated. This keeps the model list and /login selector uncluttered.
+  for (let accountNumber = 1; accountNumber <= MAX_GLOBAL_QODER_ACCOUNTS; accountNumber++) {
+    if (accountNumber > 1 && !getCachedCredentials("", globalProviderID(accountNumber - 1))?.access) break;
+
+    const providerID = globalProviderID(accountNumber);
     try {
-      await autoLoginQoderFromEnvironment(providerID, mode);
-      await refreshModelsAtStartup(providerID, mode);
+      await autoLoginQoderFromEnvironment(providerID, globalMode);
+      await refreshModelsAtStartup(providerID, globalMode);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
     }
+
+    registerGlobalProvider(pi, accountNumber, globalMode);
+    if (!getCachedCredentials("", providerID)?.access) break;
+  }
+
+  try {
+    await autoLoginQoderFromEnvironment("qoder-cn", "cn");
+    await refreshModelsAtStartup("qoder-cn", "cn");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[pi-provider-qoder] Automatic login failed for qoder-cn: ${message}`);
   }
 
   // Refresh the models cache once per session at startup if it is missing or
@@ -107,11 +162,11 @@ export default async function (pi: ExtensionAPI) {
   // Login/refresh are the other rebuild triggers; this covers the case where
   // the cache was deleted while the token is still valid.
   pi.on("session_start", async (_event, ctx) => {
-    for (const [providerID, mode] of [
-      ["qoder", getQoderMode()],
-      ["qoder-2", getQoderMode()],
+    const providers: Array<[string, string]> = [
+      ...Array.from(registeredGlobalProviderIDs, (providerID) => [providerID, globalMode] as [string, string]),
       ["qoder-cn", "cn"],
-    ] as const) {
+    ];
+    for (const [providerID, mode] of providers) {
       try {
         const accessToken = await ctx.modelRegistry.getApiKeyForProvider(providerID);
         if (!accessToken || !isCacheStale(mode)) continue;
@@ -126,7 +181,5 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  registerQoderProvider(pi, "qoder", getQoderMode());
-  registerQoderProvider(pi, "qoder-2", getQoderMode());
   registerQoderProvider(pi, "qoder-cn", "cn");
 }

@@ -4,9 +4,9 @@ A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the
 
 ## Features
 
-- **Three provider entries**:
+- **Progressive provider entries**:
   - `qoder` — Global / international Qoder account 1.
-  - `qoder-2` — Global / international Qoder account 2.
+  - `qoder-2`, `qoder-3`, ... — additional global accounts, exposed one slot at a time after the previous account is logged in.
   - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
 - **Interactive Login**: Global Qoder supports browser device-code flow or Personal Access Token (PAT) login.
 - **Qoder CN PAT Login**: China edition uses a separate PAT login entry (`/login qoder-cn`) and CN token exchange endpoints.
@@ -37,15 +37,16 @@ Global / international edition, account 1:
 /login qoder
 ```
 
-Global / international edition, account 2:
+Global / international edition, account 2 (shown after account 1 is logged in):
 
 ```text
 /login qoder-2
 ```
 
-After logging in to both accounts, switch manually between
-`qoder/<model-id>` and `qoder-2/<model-id>` in the model selector (or with the
-corresponding `--model` value). The two accounts are stored independently;
+After logging in to account 2, the next slot (`qoder-3`) becomes available in
+`/login`. The same pattern continues for additional accounts. Switch manually
+between `qoder/<model-id>`, `qoder-2/<model-id>`, and so on in the model selector
+(or with the corresponding `--model` value). Accounts are stored independently;
 quota exhaustion does not switch accounts automatically.
 
 China edition:
@@ -67,11 +68,11 @@ Global Qoder account 1:
 - `QODER_API_KEY` is also accepted; when set, pi automatically exchanges it
   and logs the provider in during startup.
 
-Global Qoder account 2:
+Global Qoder account 2 and later accounts:
 
-- Run `/login qoder-2` and choose **Use API Key (PAT)**, then paste the second token.
-- Or set `QODER_PERSONAL_ACCESS_TOKEN_2` (or `QODER_PAT_2`) before starting pi.
-- `QODER_API_KEY_2` is also accepted for automatic startup login.
+- Run `/login qoder-2` (then `/login qoder-3`, etc.) and choose **Use API Key (PAT)**, then paste the token for that account.
+- Or set the matching suffixed variables before starting pi, for example `QODER_PERSONAL_ACCESS_TOKEN_2` / `QODER_PAT_2` / `QODER_API_KEY_2`.
+- The suffix matches the account slot number; the next provider slot is exposed only after the previous slot is authenticated.
 
 Qoder China:
 
