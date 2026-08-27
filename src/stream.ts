@@ -74,7 +74,6 @@ function stableChatRecordID(
   return hash.digest("hex").slice(0, 16);
 }
 
-
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -259,7 +258,6 @@ export function streamQoder(
       });
 
       const modelSource = modelConfig.source || "system";
-
 
       const response = await fetch(chatURL, {
         method: "POST",

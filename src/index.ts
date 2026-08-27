@@ -39,7 +39,7 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   }) as unknown as Model<Api>[];
 }
 
-function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsage {
+function createQoderOAuth(_providerID: string, mode: string): OAuthConfigWithUsage {
   return {
     name: isQoderCNMode(mode) ? "Qoder CN (PAT)" : "Qoder (Browser OAuth / PAT)",
     login: isQoderCNMode(mode) ? loginQoderCN : loginQoder,
