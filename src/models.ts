@@ -62,7 +62,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -101,7 +101,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text", "image"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {
@@ -114,7 +114,7 @@ export const staticModels: QoderModelDef[] = [
     supportsEffort: false,
     input: ["text"],
     cost: ZERO_COST,
-    contextWindow: 180000,
+    contextWindow: 1000000,
     maxTokens: 32768,
   },
   {

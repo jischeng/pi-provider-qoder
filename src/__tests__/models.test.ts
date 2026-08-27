@@ -29,6 +29,13 @@ describe("staticModels", () => {
     }
   });
 
+  it("uses the verified 1M context window for large-context models", () => {
+    const contextWindows = new Map(staticModels.map((m) => [m.id, m.contextWindow]));
+    for (const id of ["auto", "efficient", "lite", "gm51model"]) {
+      expect(contextWindows.get(id)).toBe(1_000_000);
+    }
+  });
+
   it("has unique IDs", () => {
     const ids = staticModels.map((m) => m.id);
     expect(new Set(ids).size).toBe(ids.length);
