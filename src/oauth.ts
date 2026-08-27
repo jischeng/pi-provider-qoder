@@ -19,13 +19,18 @@ const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 
 /** Return the PAT exposed through the environment for a provider mode. */
 export function getQoderPatForMode(mode: string, providerID = "qoder"): string {
-  if (isQoderCNMode(mode)) {
-    return process.env.QODERCN_API_KEY || process.env.QODERCN_PERSONAL_ACCESS_TOKEN || process.env.QODERCN_PAT || "";
-  }
-
-  const accountMatch = /^qoder-(\d+)$/.exec(providerID);
+  const accountMatch = /-(\d+)$/.exec(providerID);
   const accountNumber = accountMatch ? Number(accountMatch[1]) : 1;
   const suffix = accountNumber > 1 ? `_${accountNumber}` : "";
+
+  if (isQoderCNMode(mode)) {
+    return (
+      process.env[`QODERCN_API_KEY${suffix}`] ||
+      process.env[`QODERCN_PERSONAL_ACCESS_TOKEN${suffix}`] ||
+      process.env[`QODERCN_PAT${suffix}`] ||
+      ""
+    );
+  }
   return (
     process.env[`QODER_API_KEY${suffix}`] ||
     process.env[`QODER_PERSONAL_ACCESS_TOKEN${suffix}`] ||

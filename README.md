@@ -7,7 +7,8 @@ A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the
 - **Progressive provider entries**:
   - `qoder` — Global / international Qoder account 1.
   - `qoder-2`, `qoder-3`, ... — additional global accounts, exposed one slot at a time after the previous account is logged in.
-  - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
+  - `qoder-cn`, `qoder-cn-2`, `qoder-cn-3`, ... — Qoder China accounts exposed progressively in the same way.
+  - All Qoder CN providers use CN endpoints and are independent of `QODER_REGION`.
 - **Interactive Login**: Global Qoder supports browser device-code flow or Personal Access Token (PAT) login.
 - **Qoder CN PAT Login**: China edition uses a separate PAT login entry (`/login qoder-cn`) and CN token exchange endpoints.
 - **WAF Bypass**: Built-in WAF obfuscation and body encoding (`Encode=1`).
@@ -20,13 +21,13 @@ A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the
 Install the provider:
 
 ```bash
-pi install npm:pi-provider-qoder
+pi install npm:@jischeng/pi-provider-qoder
 ```
 
 Or install it globally with npm:
 
 ```bash
-npm install -g pi-provider-qoder
+npm install -g @jischeng/pi-provider-qoder
 ```
 
 Then log in from pi.
@@ -49,11 +50,16 @@ between `qoder/<model-id>`, `qoder-2/<model-id>`, and so on in the model selecto
 (or with the corresponding `--model` value). Accounts are stored independently;
 quota exhaustion does not switch accounts automatically.
 
-China edition:
+China edition, account 1:
 
 ```text
 /login qoder-cn
 ```
+
+After account 1 is logged in, `/login qoder-cn-2` becomes available. After
+account 2 is logged in, `/login qoder-cn-3` becomes available, and so on.
+Switch manually between `qoder-cn/<model-id>`, `qoder-cn-2/<model-id>`, and
+later account providers in the model selector.
 
 ### Personal Access Token (PAT)
 
@@ -74,11 +80,17 @@ Global Qoder account 2 and later accounts:
 - Or set the matching suffixed variables before starting pi, for example `QODER_PERSONAL_ACCESS_TOKEN_2` / `QODER_PAT_2` / `QODER_API_KEY_2`.
 - The suffix matches the account slot number; the next provider slot is exposed only after the previous slot is authenticated.
 
-Qoder China:
+Qoder China account 1:
 
 - Run `/login qoder-cn`, then paste the CN PAT.
 - Or set `QODERCN_PERSONAL_ACCESS_TOKEN` (or `QODERCN_PAT`) before starting pi.
 - `QODERCN_API_KEY` is also accepted and triggers the same automatic startup login.
+
+Qoder China account 2 and later accounts:
+
+- Run `/login qoder-cn-2` (then `/login qoder-cn-3`, etc.) and paste the PAT for that account.
+- Or set matching suffixed variables, for example `QODERCN_PERSONAL_ACCESS_TOKEN_2`, `QODERCN_PAT_2`, or `QODERCN_API_KEY_2`.
+- The next CN provider slot appears only after the previous slot is authenticated.
 
 > The exchanged job token is short-lived; the provider transparently re-exchanges
 > the stored PAT when it expires.

@@ -72,6 +72,14 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
     expect(getQoderPatForMode("global", "qoder-2")).toBe("");
   });
 
+  it("uses separate environment variables for the second CN account", () => {
+    process.env.QODERCN_PERSONAL_ACCESS_TOKEN = "pt-cn-123";
+    process.env.QODERCN_PERSONAL_ACCESS_TOKEN_2 = "pt-cn-456";
+
+    expect(getQoderPatForMode("cn", "qoder-cn")).toBe("pt-cn-123");
+    expect(getQoderPatForMode("cn", "qoder-cn-2")).toBe("pt-cn-456");
+  });
+
   it("does nothing if no PAT in environment", async () => {
     delete process.env.QODER_PERSONAL_ACCESS_TOKEN;
     delete process.env.QODER_API_KEY;
