@@ -74,6 +74,26 @@ const BLOCKED_SSE = sseEnvelope(
   "Not Acceptable",
 );
 
+const QUEUED_SSE = sseEnvelope(
+  {
+    code: "403",
+    message: JSON.stringify({
+      code: "10605",
+      message: JSON.stringify({
+        isQueued: false,
+        modelKey: "qfmodel",
+        queueCount: 0,
+        queueType: "ultrafast",
+        retryAfterSeconds: 0,
+        serviceAvailable: true,
+        waitTime: 0,
+      }),
+    }),
+  },
+  403,
+  "Forbidden",
+);
+
 function mockFetch(body: string): typeof fetch {
   const response = new Response(body, {
     status: 200,
@@ -290,6 +310,29 @@ describe("streamQoder", () => {
     expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
     expect(msg.stopReason).toBe("stop");
   });
+  it("retries a transient 10605 queue response", async () => {
+    const responses = [QUEUED_SSE, SUCCESS_SSE].map(
+      (body) => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const chatCalls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/userinfo")) {
+        return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      chatCalls.push(url);
+      return responses.shift() as Response;
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    expect(chatCalls).toHaveLength(2);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(events.some((event) => event.type === "done")).toBe(true);
+  });
+
   it("finishes when the gateway sends [DONE] but keeps the body open", async () => {
     // Qoder's gateway does not always close the HTTP body after the sentinel.
     // The read loop used to keep awaiting reader.read() until the socket went

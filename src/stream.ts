@@ -74,6 +74,175 @@ function stableChatRecordID(
   return hash.digest("hex").slice(0, 16);
 }
 
+const MAX_QUEUE_RETRIES = 4;
+const MAX_QUEUE_RETRY_DELAY_SECONDS = 60;
+
+type QueueRetryInfo = {
+  retryAfterSeconds: number;
+};
+
+/** Find Qoder's nested 10605 queue response in an SSE envelope or JSON body. */
+function findQueueRetryInfo(value: unknown, depth = 0): QueueRetryInfo | null {
+  if (depth > 5) return null;
+
+  if (typeof value === "string") {
+    try {
+      return findQueueRetryInfo(JSON.parse(value), depth + 1);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (String(record.code) === "10605") {
+    const retryAfterSeconds =
+      typeof record.retryAfterSeconds === "number" && Number.isFinite(record.retryAfterSeconds)
+        ? Math.max(0, record.retryAfterSeconds)
+        : 3;
+    return { retryAfterSeconds };
+  }
+
+  for (const key of ["body", "message"]) {
+    const nested = findQueueRetryInfo(record[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+type QueueInspection = {
+  response: Response;
+  queue: QueueRetryInfo | null;
+};
+
+function responseWithBody(response: Response, body: BodyInit | null): Response {
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/** Inspect the first response event while preserving it for the real parser. */
+async function inspectResponseForQueue(response: Response): Promise<QueueInspection> {
+  if (!response.body) return { response, queue: null };
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let sourceDone = false;
+  let firstDataLineSeen = false;
+  let queue: QueueRetryInfo | null = null;
+
+  if (!response.ok) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    const text = decoder.decode(Buffer.concat(chunks));
+    return { response: responseWithBody(response, text), queue: findQueueRetryInfo(text) };
+  }
+
+  while (!firstDataLineSeen && buffer.length < 64 * 1024) {
+    const { done, value } = await reader.read();
+    if (done) {
+      sourceDone = true;
+      break;
+    }
+    chunks.push(value);
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const lineEnd = buffer.indexOf("\n");
+      if (lineEnd === -1) break;
+      const line = buffer.substring(0, lineEnd).trim();
+      buffer = buffer.substring(lineEnd + 1);
+      if (!line.startsWith("data:")) continue;
+
+      firstDataLineSeen = true;
+      const dataStr = line.substring(5).trim();
+      if (dataStr !== "[DONE]") {
+        try {
+          queue = findQueueRetryInfo(JSON.parse(dataStr));
+        } catch {}
+      }
+      break;
+    }
+  }
+
+  if (queue) {
+    await reader.cancel().catch(() => {});
+    return { response, queue };
+  }
+
+  const replayBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      if (sourceDone) controller.close();
+    },
+    async pull(controller) {
+      if (sourceDone) return;
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          sourceDone = true;
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return { response: responseWithBody(response, replayBody), queue: null };
+}
+
+function waitForQueueRetry(seconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Operation aborted", "AbortError"));
+  const delay = Math.min(Math.max(seconds, 0), MAX_QUEUE_RETRY_DELAY_SECONDS) * 1000;
+  if (delay === 0) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Operation aborted", "AbortError"));
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delay);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function fetchWithQueueRetry(url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const inspected = await inspectResponseForQueue(await fetch(url, init));
+    if (!inspected.queue) return inspected.response;
+    if (attempt >= MAX_QUEUE_RETRIES) {
+      throw new Error(`Qoder queue remained busy (10605) after ${MAX_QUEUE_RETRIES} retries`);
+    }
+
+    if (process.env.QODER_DEBUG) {
+      console.error(
+        `[pi-provider-qoder] Qoder queue busy (10605), retrying in ${inspected.queue.retryAfterSeconds}s (${attempt + 1}/${MAX_QUEUE_RETRIES})`,
+      );
+    }
+    await waitForQueueRetry(inspected.queue.retryAfterSeconds, signal);
+  }
+}
+
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -259,20 +428,24 @@ export function streamQoder(
 
       const modelSource = modelConfig.source || "system";
 
-      const response = await fetch(chatURL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Accept-Encoding": "identity",
-          "X-Model-Key": qoderModel,
-          "X-Model-Source": modelSource,
-          ...headers,
+      const response = await fetchWithQueueRetry(
+        chatURL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Accept-Encoding": "identity",
+            "X-Model-Key": qoderModel,
+            "X-Model-Source": modelSource,
+            ...headers,
+          },
+          body: encodedBytes,
+          signal: options?.signal,
         },
-        body: encodedBytes,
-        signal: options?.signal,
-      });
+        options?.signal,
+      );
 
       if (!response.ok) {
         const errText = await response.text();
