@@ -1,205 +1,156 @@
-# pi-provider-qoder
+# @jischeng/pi-provider-qoder
 
-A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the **Qoder API**, exposing Qoder Global and Qoder China models through provider surfaces.
+[English README](./README.en.md)
 
-## Features
+[Pi](https://pi.dev/) 的 Qoder AI Provider 扩展。它将 Qoder 国际版和中国版接入 Pi，并把 Qoder 可用的模型显示在 Pi 的模型选择器中。
 
-- **Progressive provider entries**:
-  - `qoder` — Global / international Qoder account 1.
-  - `qoder-2`, `qoder-3`, ... — additional global accounts, exposed one slot at a time after the previous account is logged in.
-  - `qoder-cn`, `qoder-cn-2`, `qoder-cn-3`, ... — Qoder China accounts exposed progressively in the same way.
-  - All Qoder CN providers use CN endpoints and are independent of `QODER_REGION`.
-- **Interactive Login**: Global Qoder supports browser device-code flow or Personal Access Token (PAT) login.
-- **Qoder CN PAT Login**: China edition uses a separate PAT login entry (`/login qoder-cn`) and CN token exchange endpoints.
-- **WAF Bypass**: Built-in WAF obfuscation and body encoding (`Encode=1`).
-- **COSY Signing**: Full COSY signature header generation (RSA/AES-CBC/MD5).
-- **Dynamic Model Catalog**: Dynamically fetches model limits, effort configurations, and options from the `/algo/api/v2/model/list` endpoint.
-- **Reasoning/Thinking Support**: Real-time extraction of thinking process from API reasoning or HTML-like `<think>` tags.
+## 主要能力
 
-## Quick start
+- 支持 Qoder 国际版和 Qoder 中国版
+- 国际版和中国版均支持 PAT 登录（PAT 会先交换为短期 job token）
+- 国际版额外支持浏览器 OAuth / device-code 登录；中国版目前仅支持 PAT 登录
+- 支持多个独立 Qoder 账号：`qoder`、`qoder-2`、`qoder-cn`、`qoder-cn-2` 等
+- 内置 Qoder COSY 请求签名和 WAF 兼容的请求编码
+- 支持流式响应和 reasoning/thinking
+- 动态获取模型目录、上下文限制、视觉能力、推理能力、effort 选项和价格倍率
 
-Install the provider:
+## 安装
 
 ```bash
 pi install npm:@jischeng/pi-provider-qoder
 ```
 
-Or install it globally with npm:
+## 登录和使用
 
-```bash
-npm install -g @jischeng/pi-provider-qoder
-```
-
-Then log in from pi.
-
-Global / international edition, account 1:
+Qoder 国际版：
 
 ```text
 /login qoder
+/model auto
 ```
 
-Global / international edition, account 2 (shown after account 1 is logged in):
-
-```text
-/login qoder-2
-```
-
-After logging in to account 2, the next slot (`qoder-3`) becomes available in
-`/login`. The same pattern continues for additional accounts. Switch manually
-between `qoder/<model-id>`, `qoder-2/<model-id>`, and so on in the model selector
-(or with the corresponding `--model` value). Accounts are stored independently;
-quota exhaustion does not switch accounts automatically.
-
-China edition, account 1:
+Qoder 中国版：
 
 ```text
 /login qoder-cn
-```
-
-After account 1 is logged in, `/login qoder-cn-2` becomes available. After
-account 2 is logged in, `/login qoder-cn-3` becomes available, and so on.
-Switch manually between `qoder-cn/<model-id>`, `qoder-cn-2/<model-id>`, and
-later account providers in the model selector.
-
-### Personal Access Token (PAT)
-
-A Qoder PAT (`pt-...`) cannot authenticate API calls directly — the provider
-exchanges it for a short-lived job token (mirroring the official `qodercli` /
-`qoderclicn` flow) and resolves your account identity automatically.
-
-Global Qoder account 1:
-
-- Run `/login qoder` and choose **Use API Key (PAT)**, then paste the token.
-- Or set `QODER_PERSONAL_ACCESS_TOKEN` (or `QODER_PAT`) before starting pi.
-- `QODER_API_KEY` is also accepted; when set, pi automatically exchanges it
-  and logs the provider in during startup.
-
-Global Qoder account 2 and later accounts:
-
-- Run `/login qoder-2` (then `/login qoder-3`, etc.) and choose **Use API Key (PAT)**, then paste the token for that account.
-- Or set the matching suffixed variables before starting pi, for example `QODER_PERSONAL_ACCESS_TOKEN_2` / `QODER_PAT_2` / `QODER_API_KEY_2`.
-- The suffix matches the account slot number; the next provider slot is exposed only after the previous slot is authenticated.
-
-Qoder China account 1:
-
-- Run `/login qoder-cn`, then paste the CN PAT.
-- Or set `QODERCN_PERSONAL_ACCESS_TOKEN` (or `QODERCN_PAT`) before starting pi.
-- `QODERCN_API_KEY` is also accepted and triggers the same automatic startup login.
-
-Qoder China account 2 and later accounts:
-
-- Run `/login qoder-cn-2` (then `/login qoder-cn-3`, etc.) and paste the PAT for that account.
-- Or set matching suffixed variables, for example `QODERCN_PERSONAL_ACCESS_TOKEN_2`, `QODERCN_PAT_2`, or `QODERCN_API_KEY_2`.
-- The next CN provider slot appears only after the previous slot is authenticated.
-
-> The exchanged job token is short-lived; the provider transparently re-exchanges
-> the stored PAT when it expires.
-
-### Region environment variables
-
-The provider also understands these optional variables:
-
-```bash
-export QODER_REGION=cn       # or QODER_BACKEND=cn / QODER_MODE=cn
-```
-
-Setting a CN PAT without a global PAT also auto-selects CN mode for the `qoder`
-entry, but the recommended explicit China entry is still `/login qoder-cn` and
-`--provider qoder-cn`.
-
-## Endpoints
-
-Global:
-
-- PAT exchange: `https://openapi.qoder.sh/api/v1/jobToken/exchange`
-- User info: `https://openapi.qoder.sh/api/v1/userinfo`
-- Usage: `https://openapi.qoder.sh/api/v2/quota/usage`
-- Model / chat gateway: `https://api3.qoder.sh/algo/api/v2/...`
-
-China:
-
-- PAT exchange: `https://openapi.qoder.com.cn/api/v1/jobToken/exchange`
-- User info: `https://openapi.qoder.com.cn/api/v1/userinfo`
-- Usage: `https://openapi.qoder.com.cn/api/v2/quota/usage`
-- Model / chat gateway: `https://gateway.qoder.com.cn/algo/api/v2/...`
-
-## Models
-
-### Global `qoder` and `qoder-2`
-
-Both global provider entries expose the same backing model keys returned by
-Qoder. The selected provider determines which logged-in account is used.
-
-Exposes the backing model keys returned by Qoder, including:
-
-- **Tier Models**: `auto`, `ultimate`, `performance`, `efficient`, `lite`
-- **Frontier Models**:
-  - `qmodel` (Qwen3.7 Plus)
-  - `cmodel` (Cantus)
-  - `qmodel_preview` (Qwen3.8 Max Preview)
-  - `qmodel_latest` (Qwen3.7 Max)
-  - `dmodel` (DeepSeek V4 Pro)
-  - `dfmodel` (DeepSeek V4 Flash)
-  - `gm51model` (GLM 5.2)
-  - `kmodel` (Kimi K2.7 Code)
-  - `kmodel_latest` (Kimi K3)
-  - `mmodel` (MiniMax M3)
-
-### China `qoder-cn`
-
-The China provider exposes friendly model IDs and maps them back to Qoder CN's
-internal keys at request time:
-
-| Friendly ID | Qoder CN key | Context | Images | Reasoning |
-| --- | --- | ---: | :---: | :---: |
-| `auto` | `auto` | 180K | ✅ | ✅ |
-| `qwen3.7-max` | `qmodel_latest` | 1M | ✅ | ✅ |
-| `qwen3.7-plus` | `qmodel` | 1M | ❌ | ✅ |
-| `qwen3.6-flash` | `q36fmodel` | 1M | ❌ | ✅ |
-| `deepseek-v4-pro` | `dmodel` | 1M | ❌ | ✅ |
-| `deepseek-v4-flash` | `dfmodel` | 1M | ❌ | ❌ |
-| `glm-5.2` | `gm51model` | 200K | ✅ | ✅ |
-| `kimi-k2.6` | `kmodel` | 256K | ✅ | ✅ |
-| `minimax-m2.7` | `mmodel` | 200K | ❌ | ❌ |
-
-Compatibility aliases are also accepted for request mapping, such as
-`qwen3.6-plus` → `qmodel`, `glm-5.1` → `gm51model`, and `minimax-m3` → `mmodel`.
-
-## Usage
-
-Once logged in, select any Qoder model in pi:
-
-```text
 /model qwen3.7-plus
 ```
 
-Or start directly:
-
-```bash
-pi --provider qoder-cn --model qwen3.7-plus
-```
-
-Global example:
+也可以直接指定 Provider 和模型启动 Pi：
 
 ```bash
 pi --provider qoder --model auto
+pi --provider qoder-cn --model qwen3.7-plus
 ```
 
-## Architecture
+登录第一个账号后，下一个账号入口会自动出现：
 
 ```text
-src/
-├── index.ts            # Extension registration
-├── cosy.ts             # COSY signature, machine ID, region/endpoints, CN model aliases
-├── login.ts            # OAuth device flow + PAT login sequence
-├── pat.ts              # PAT → job-token exchange + identity resolution
-├── models.ts           # Model definitions and dynamic config cache
-├── oauth.ts            # PAT / OAuth callback orchestrator
-├── stream.ts           # Main streaming response handler
-├── transform.ts        # Message conversions (OpenAI schema mapping)
-├── thinking-parser.ts  # Fallback <think> tag parser
-└── qoder-encoding.ts   # WAF bypass body encoder
+/login qoder-2
+/login qoder-cn-2
 ```
+
+账号之间相互独立，需要通过 `qoder/<model-id>`、`qoder-2/<model-id>`、
+`qoder-cn/<model-id>` 等方式明确选择账号。
+
+## 模型 ID 和模型名称映射
+
+模型 **ID** 是 Pi 实际使用的值，模型名称是模型选择器中显示的名称。
+
+Qoder 的模型目录接口返回的是服务端模型 ID（例如 `qmodel_latest`、`dmodel`）。国际版直接使用这些 Qoder 原生 ID；中国版为了让模型选择器更易读，会将已知的服务端 ID 映射为更友好的模型 ID，并在发送请求时再映射回 Qoder 内部 ID。因此这不是两个版本模型能力不同，而是界面命名和请求映射方式不同。
+
+### Qoder 国际版
+
+| 模型 ID | 显示名称（可能包含倍率） |
+| --- | --- |
+| `auto` | Qoder Auto |
+| `ultimate` | Qoder Ultimate |
+| `performance` | Qoder Performance |
+| `efficient` | Qoder Efficient |
+| `lite` | Qoder Lite |
+| `qmodel` | Qwen3.7 Plus (Qoder) |
+| `cmodel` | Cantus (Qoder) |
+| `qmodel_preview` | Qwen3.8 Max Preview (Qoder) |
+| `qmodel_latest` | Qwen3.7 Max (Qoder) |
+| `dmodel` | DeepSeek V4 Pro (Qoder) |
+| `dfmodel` | DeepSeek V4 Flash (Qoder) |
+| `gm51model` | GLM 5.2 (Qoder) |
+| `kmodel` | Kimi K2.7 Code (Qoder) |
+| `kmodel_latest` | Kimi K3 (Qoder) |
+| `mmodel` | MiniMax M3 (Qoder) |
+
+### Qoder 中国版
+
+| Pi 模型 ID | Qoder 内部 ID | 显示名称（可能包含倍率） |
+| --- | --- | --- |
+| `auto` | `auto` | Auto · Qoder CN |
+| `qwen3.7-max` | `qmodel_latest` | Qwen 3.7 Max · Qoder CN |
+| `qwen3.7-plus` | `qmodel` | Qwen 3.7 Plus · Qoder CN |
+| `qwen3.6-flash` | `q36fmodel` | Qwen 3.6 Flash · Qoder CN |
+| `deepseek-v4-pro` | `dmodel` | DeepSeek V4 Pro · Qoder CN |
+| `deepseek-v4-flash` | `dfmodel` | DeepSeek V4 Flash · Qoder CN |
+| `glm-5.2` | `gm51model` | GLM 5.2 · Qoder CN |
+| `kimi-k2.6` | `kmodel` | Kimi K2.6 · Qoder CN |
+| `minimax-m2.7` | `mmodel` | MiniMax M2.7 · Qoder CN |
+
+中国版还兼容以下别名：
+
+- `qwen3.6-plus` → `qmodel`
+- `glm-5.1` → `gm51model`
+- `minimax-m3` → `mmodel`
+
+### 自动检测新模型
+
+Qoder 可能会新增、移除或重命名模型。插件启动时会自动获取 Qoder 实时模型目录，
+检测当前启用的模型及其上下文长度、视觉/推理能力、effort 选项和价格倍率。
+
+如果 Qoder 返回了价格倍率，倍率会直接追加到模型显示名称后面，例如：
+`Qwen3.7 Max (Qoder) (0.5x)`。这表示该模型在 Qoder 侧的额度/计费倍率为 `0.5x`，
+不代表 Pi 的 API 价格发生了变化。模型目录会缓存在本地，并在缓存过期时刷新（目前为 1 小时）。
+
+**如果要看到新检测到的模型，请完全退出 Pi 后重新启动。**
+因为模型选择器会在插件加载时创建。
+
+## Personal Access Token（PAT）
+
+国际版和中国版的 PAT 登录流程一致：Qoder PAT（`pt-...`）会自动交换为短期 job token，PAT 本身不会直接发送到聊天 API。中国版目前没有可用的浏览器 device-code 登录流程，因此需要使用 CN PAT。
+
+支持的环境变量：
+
+| Provider | 第一个账号 | 其他账号 |
+| --- | --- | --- |
+| 国际版 | `QODER_PERSONAL_ACCESS_TOKEN`、`QODER_PAT` 或 `QODER_API_KEY` | 添加 `_2`、`_3` 等后缀 |
+| 中国版 | `QODERCN_PERSONAL_ACCESS_TOKEN`、`QODERCN_PAT` 或 `QODERCN_API_KEY` | 添加 `_2`、`_3` 等后缀 |
+
+例如：
+
+```bash
+export QODER_PERSONAL_ACCESS_TOKEN="pt-..."
+export QODERCN_PERSONAL_ACCESS_TOKEN="pt-..."
+```
+
+也可以配置国际版 Provider 使用的后端：
+
+```bash
+export QODER_REGION=cn
+# 也支持 QODER_BACKEND=cn 和 QODER_MODE=cn
+```
+
+中国账号推荐直接使用 `qoder-cn` Provider。
+
+## 服务端点
+
+国际版：
+
+- Token 交换和账号信息：`https://openapi.qoder.sh`
+- 用量查询：`https://openapi.qoder.sh/api/v2/quota/usage`
+- 模型和聊天网关：`https://api3.qoder.sh`
+
+中国版：
+
+- Token 交换和账号信息：`https://openapi.qoder.com.cn`
+- 用量查询：`https://openapi.qoder.com.cn/api/v2/quota/usage`
+- 模型和聊天网关：`https://gateway.qoder.com.cn`
 
 ## License
 
