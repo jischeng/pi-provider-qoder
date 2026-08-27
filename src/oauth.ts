@@ -18,11 +18,18 @@ export interface QoderCredentials extends OAuthCredentials {
 const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
 
 /** Return the PAT exposed through the environment for a provider mode. */
-export function getQoderPatForMode(mode: string): string {
+export function getQoderPatForMode(mode: string, providerID = "qoder"): string {
   if (isQoderCNMode(mode)) {
     return process.env.QODERCN_API_KEY || process.env.QODERCN_PERSONAL_ACCESS_TOKEN || process.env.QODERCN_PAT || "";
   }
-  return process.env.QODER_API_KEY || process.env.QODER_PERSONAL_ACCESS_TOKEN || process.env.QODER_PAT || "";
+
+  const suffix = providerID === "qoder-2" ? "_2" : "";
+  return (
+    process.env[`QODER_API_KEY${suffix}`] ||
+    process.env[`QODER_PERSONAL_ACCESS_TOKEN${suffix}`] ||
+    process.env[`QODER_PAT${suffix}`] ||
+    ""
+  );
 }
 
 function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredentials): void {
@@ -46,7 +53,7 @@ function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredent
 
 /** Exchange an environment PAT before pi resolves its initial model. */
 export async function autoLoginQoderFromEnvironment(providerID: string, mode: string): Promise<void> {
-  const pat = getQoderPatForMode(mode);
+  const pat = getQoderPatForMode(mode, providerID);
   if (!pat) return;
 
   // An explicitly supplied PAT is authoritative. The auth file only stores
@@ -131,12 +138,15 @@ export async function resolveQoderIdentity(
   return creds;
 }
 
-async function loginQoderForMode(callbacks: OAuthLoginCallbacks, mode: string): Promise<OAuthCredentials> {
-  const providerID = isQoderCNMode(mode) ? "qoder-cn" : "qoder";
+async function loginQoderForMode(
+  callbacks: OAuthLoginCallbacks,
+  mode: string,
+  providerID = isQoderCNMode(mode) ? "qoder-cn" : "qoder",
+): Promise<OAuthCredentials> {
   // 1. Try environment variables first (PAT). A PAT (pt-...) must be exchanged
   //    for a short-lived job token before it can be used — credentialsFromPat
   //    handles the exchange + identity resolution.
-  const pat = getQoderPatForMode(mode);
+  const pat = getQoderPatForMode(mode, providerID);
   if (pat) {
     try {
       const creds = await credentialsFromPat(pat, mode);
@@ -170,11 +180,15 @@ async function loginQoderForMode(callbacks: OAuthLoginCallbacks, mode: string): 
 }
 
 export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  return loginQoderForMode(callbacks, getQoderMode());
+  return loginQoderForMode(callbacks, getQoderMode(), "qoder");
+}
+
+export async function loginQoder2(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+  return loginQoderForMode(callbacks, getQoderMode(), "qoder-2");
 }
 
 export async function loginQoderCN(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  return loginQoderForMode(callbacks, "cn");
+  return loginQoderForMode(callbacks, "cn", "qoder-cn");
 }
 
 export async function refreshQoderToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {

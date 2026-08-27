@@ -12,6 +12,7 @@ import {
   autoLoginQoderFromEnvironment,
   getCachedCredentials,
   loginQoder,
+  loginQoder2,
   loginQoderCN,
   refreshQoderToken,
   refreshQoderTokenCN,
@@ -39,10 +40,15 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   }) as unknown as Model<Api>[];
 }
 
-function createQoderOAuth(_providerID: string, mode: string): OAuthConfigWithUsage {
+function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsage {
+  const isSecondGlobalAccount = providerID === "qoder-2";
   return {
-    name: isQoderCNMode(mode) ? "Qoder CN (PAT)" : "Qoder (Browser OAuth / PAT)",
-    login: isQoderCNMode(mode) ? loginQoderCN : loginQoder,
+    name: isQoderCNMode(mode)
+      ? "Qoder CN (PAT)"
+      : isSecondGlobalAccount
+        ? "Qoder Account 2 (Browser OAuth / PAT)"
+        : "Qoder Account 1 (Browser OAuth / PAT)",
+    login: isQoderCNMode(mode) ? loginQoderCN : isSecondGlobalAccount ? loginQoder2 : loginQoder,
     refreshToken: isQoderCNMode(mode) ? refreshQoderTokenCN : refreshQoderToken,
     getApiKey: (cred: OAuthCredentials) => cred.access,
     // NOTE: no `modifyModels` hook on purpose. OMP (Bun) does a whole-catalog
@@ -57,6 +63,7 @@ function createQoderOAuth(_providerID: string, mode: string): OAuthConfigWithUsa
 function registerQoderProvider(pi: ExtensionAPI, providerID: string, mode: string): void {
   const oauth = createQoderOAuth(providerID, mode);
   pi.registerProvider(providerID, {
+    name: providerID === "qoder-2" ? "Qoder (Account 2)" : providerID === "qoder" ? "Qoder (Account 1)" : "Qoder CN",
     baseUrl: getQoderBaseUrl(mode),
     api: "qoder-api" as Api,
     models: modelsForProvider(mode, providerID) as unknown as ProviderConfig["models"],
@@ -83,6 +90,7 @@ async function refreshModelsAtStartup(providerID: string, mode: string): Promise
 export default async function (pi: ExtensionAPI) {
   for (const [providerID, mode] of [
     ["qoder", getQoderMode()],
+    ["qoder-2", getQoderMode()],
     ["qoder-cn", "cn"],
   ] as const) {
     try {
@@ -101,6 +109,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     for (const [providerID, mode] of [
       ["qoder", getQoderMode()],
+      ["qoder-2", getQoderMode()],
       ["qoder-cn", "cn"],
     ] as const) {
       try {
@@ -118,5 +127,6 @@ export default async function (pi: ExtensionAPI) {
   });
 
   registerQoderProvider(pi, "qoder", getQoderMode());
+  registerQoderProvider(pi, "qoder-2", getQoderMode());
   registerQoderProvider(pi, "qoder-cn", "cn");
 }

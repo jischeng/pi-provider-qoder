@@ -4,8 +4,9 @@ A [pi](https://shittycodingagent.ai/) provider extension that connects pi to the
 
 ## Features
 
-- **Two provider entries**:
-  - `qoder` — Global / international Qoder.
+- **Three provider entries**:
+  - `qoder` — Global / international Qoder account 1.
+  - `qoder-2` — Global / international Qoder account 2.
   - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
 - **Interactive Login**: Global Qoder supports browser device-code flow or Personal Access Token (PAT) login.
 - **Qoder CN PAT Login**: China edition uses a separate PAT login entry (`/login qoder-cn`) and CN token exchange endpoints.
@@ -30,11 +31,22 @@ npm install -g pi-provider-qoder
 
 Then log in from pi.
 
-Global / international edition:
+Global / international edition, account 1:
 
 ```text
 /login qoder
 ```
+
+Global / international edition, account 2:
+
+```text
+/login qoder-2
+```
+
+After logging in to both accounts, switch manually between
+`qoder/<model-id>` and `qoder-2/<model-id>` in the model selector (or with the
+corresponding `--model` value). The two accounts are stored independently;
+quota exhaustion does not switch accounts automatically.
 
 China edition:
 
@@ -48,12 +60,18 @@ A Qoder PAT (`pt-...`) cannot authenticate API calls directly — the provider
 exchanges it for a short-lived job token (mirroring the official `qodercli` /
 `qoderclicn` flow) and resolves your account identity automatically.
 
-Global Qoder:
+Global Qoder account 1:
 
 - Run `/login qoder` and choose **Use API Key (PAT)**, then paste the token.
 - Or set `QODER_PERSONAL_ACCESS_TOKEN` (or `QODER_PAT`) before starting pi.
 - `QODER_API_KEY` is also accepted; when set, pi automatically exchanges it
   and logs the provider in during startup.
+
+Global Qoder account 2:
+
+- Run `/login qoder-2` and choose **Use API Key (PAT)**, then paste the second token.
+- Or set `QODER_PERSONAL_ACCESS_TOKEN_2` (or `QODER_PAT_2`) before starting pi.
+- `QODER_API_KEY_2` is also accepted for automatic startup login.
 
 Qoder China:
 
@@ -94,7 +112,10 @@ China:
 
 ## Models
 
-### Global `qoder`
+### Global `qoder` and `qoder-2`
+
+Both global provider entries expose the same backing model keys returned by
+Qoder. The selected provider determines which logged-in account is used.
 
 Exposes the backing model keys returned by Qoder, including:
 
