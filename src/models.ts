@@ -19,6 +19,7 @@ export interface QoderModelEntry {
   display_name?: string;
   max_input_tokens?: number;
   max_output_tokens?: number;
+  price_factor?: number;
   context_config?: Record<string, { token_count?: number; is_default?: boolean }>;
   is_vl?: boolean;
   is_reasoning?: boolean;
@@ -39,6 +40,8 @@ export interface QoderModelDef {
   cost: typeof ZERO_COST;
   contextWindow: number;
   maxTokens: number;
+  /** Qoder quota/discount multiplier, e.g. 0.5x or 0.1x. */
+  priceFactor?: number;
   description?: string;
 }
 
@@ -378,18 +381,40 @@ export const staticCnModels: QoderModelDef[] = [
   },
 ];
 
+function getPriceFactor(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+export function addPriceFactorToName(name: string, priceFactor: number | undefined): string {
+  if (priceFactor === undefined) return name;
+  const suffix = `(${priceFactor}x)`;
+  return name.endsWith(suffix) ? name : `${name} ${suffix}`;
+}
+
+function withPriceFactor(model: QoderModelDef, priceFactor: number | undefined): QoderModelDef {
+  return {
+    ...model,
+    name: addPriceFactorToName(model.name, priceFactor),
+    ...(priceFactor === undefined ? {} : { priceFactor }),
+  };
+}
+
 export function getCachedModels(mode?: string): QoderModelDef[] {
   const cachePath = getQoderCachePath(mode);
   if (existsSync(cachePath)) {
     try {
       const data = JSON.parse(readFileSync(cachePath, "utf8"));
       if (data && Array.isArray(data.models)) {
+        const configs = data.configs && typeof data.configs === "object" ? data.configs : {};
+        const models = data.models.map((model: QoderModelDef) =>
+          withPriceFactor(model, model.priceFactor ?? getPriceFactor(configs[model.id]?.price_factor)),
+        );
         // Older releases injected `auto` without a corresponding service config.
         // Keep an explicitly enabled service model, but drop the legacy fallback.
         if (data.configs && typeof data.configs === "object" && !data.configs.auto) {
-          return data.models.filter((model: QoderModelDef) => model.id !== "auto");
+          return models.filter((model: QoderModelDef) => model.id !== "auto");
         }
-        return data.models;
+        return models;
       }
     } catch {}
   }
@@ -512,6 +537,7 @@ export async function updateQoderModelsCache(
       if (!key || !entry.enable) continue;
 
       const display = entry.display_name || key;
+      const priceFactor = getPriceFactor(entry.price_factor);
       let ctxLen = entry.max_input_tokens || 180000;
       if (entry.context_config && typeof entry.context_config === "object") {
         for (const configVal of Object.values(entry.context_config)) {
@@ -533,7 +559,8 @@ export async function updateQoderModelsCache(
 
       newModels.push({
         id: modelInfo.id,
-        name: modelInfo.name,
+        name: addPriceFactorToName(modelInfo.name, priceFactor),
+        priceFactor,
         api: "qoder-api",
         provider: isQoderCNMode(mode) ? "qoder-cn" : "qoder",
         baseUrl: getQoderBaseUrl(mode),

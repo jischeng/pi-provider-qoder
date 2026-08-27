@@ -7,7 +7,14 @@ import {
   isQoderCNMode,
   toQoderCNFriendlyModel,
 } from "./cosy.js";
-import { getCachedModels, isCacheStale, staticCnModels, staticModels, updateQoderModelsCache } from "./models.js";
+import {
+  addPriceFactorToName,
+  getCachedModels,
+  isCacheStale,
+  staticCnModels,
+  staticModels,
+  updateQoderModelsCache,
+} from "./models.js";
 import {
   autoLoginQoderFromEnvironment,
   getCachedCredentials,
@@ -42,6 +49,7 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
     const model = isQoderCNMode(mode) ? toQoderCNFriendlyModel(m) : m;
     return {
       ...model,
+      name: addPriceFactorToName(model.name, m.priceFactor),
       provider: providerID,
       baseUrl: getQoderBaseUrl(mode),
     };

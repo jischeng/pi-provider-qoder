@@ -43,6 +43,29 @@ describe("Qoder model cache", () => {
     expect(cache.models.some((model: { id: string }) => model.id === "auto")).toBe(false);
   });
 
+  it("includes the dynamic Qoder price factor in the model name", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            chat: [{ key: "qmodel_38max", enable: true, display_name: "Qwen3.8-Max", price_factor: 0.5 }],
+          }),
+      }),
+    );
+
+    await updateQoderModelsCache("access-token", "user-id", "Test User", "test@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATH, "utf8"));
+    expect(cache.models[0]).toMatchObject({
+      id: "qmodel_38max",
+      name: "Qwen3.8-Max (0.5x)",
+      priceFactor: 0.5,
+    });
+    expect(getCachedModels("global")[0]?.name).toBe("Qwen3.8-Max (0.5x)");
+  });
+
   it("keeps the Cantus model returned by the current catalog", async () => {
     vi.stubGlobal(
       "fetch",
