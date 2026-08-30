@@ -512,6 +512,9 @@ export function streamQoder(
 
             const inner = JSON.parse(innerStr);
             if (inner.id) output.responseId = inner.id as string;
+            // Keep Pi's selected model identity in `output.model`. Qoder may
+            // report a different concrete backend route here; preserve that
+            // separately for diagnostics without changing assistant identity.
             if (inner.model) output.responseModel = inner.model as string;
             if (inner.usage) {
               const u = inner.usage as {

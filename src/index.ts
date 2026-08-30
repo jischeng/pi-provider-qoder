@@ -158,32 +158,14 @@ async function refreshModelsAtStartup(providerID: string, mode: string): Promise
 export default async function (pi: ExtensionAPI) {
   const globalMode = getQoderMode();
 
+  // Fetch stale catalogs before registering providers. Pi waits for the async
+  // extension factory, so /model and --list-models receive one coherent model
+  // set. Avoid refreshing again from session_start: concurrent Pi processes
+  // share the cache, and a post-registration refresh cannot update this
+  // session's already-registered model list.
+  //
   // Only expose the next account slot after the previous slot is already
   // authenticated. This keeps the model list and /login selector uncluttered.
   await initializeAccountProviders(pi, globalMode);
   await initializeAccountProviders(pi, "cn");
-
-  // Refresh the models cache once per session at startup if it is missing or
-  // stale (>1h old), rather than on every message in the stream hot path.
-  // Login/refresh are the other rebuild triggers; this covers the case where
-  // the cache was deleted while the token is still valid.
-  pi.on("session_start", async (_event, ctx) => {
-    const providers: Array<[string, string]> = Array.from(
-      registeredAccountProviderIDs,
-      (providerID) => [providerID, providerID.startsWith("qoder-cn") ? "cn" : globalMode] as [string, string],
-    );
-    for (const [providerID, mode] of providers) {
-      try {
-        const accessToken = await ctx.modelRegistry.getApiKeyForProvider(providerID);
-        if (!accessToken || !isCacheStale(mode)) continue;
-        const creds = getCachedCredentials(accessToken, providerID);
-        const userID = creds?.userID || "qoder-user";
-        const name = creds?.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User");
-        const email = creds?.email || getQoderUserEmailFallback(mode);
-        await updateQoderModelsCache(accessToken, userID, name, email, mode);
-      } catch {
-        // Best-effort: fall back to the existing cache / static models.
-      }
-    }
-  });
 }

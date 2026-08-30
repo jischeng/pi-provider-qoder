@@ -71,6 +71,10 @@ Qoder 的模型目录接口返回的是服务端模型 ID（例如 `qmodel_lates
 | `qmodel` | Qwen3.7 Plus (Qoder) |
 | `cmodel` | Cantus (Qoder) |
 | `qmodel_preview` | Qwen3.8 Max Preview (Qoder) |
+| `qmodel_38max` | Qwen3.8 Max (Qoder) |
+| `qfmodel` | Qwen3.8 Flash (Qoder) |
+| `gmodel` | GLM-5.3 (Qoder) |
+| `gfmodel` | GLM-5.3 Flash (Qoder) |
 | `qmodel_latest` | Qwen3.7 Max (Qoder) |
 | `dmodel` | DeepSeek V4 Pro (Qoder) |
 | `dfmodel` | DeepSeek V4 Flash (Qoder) |

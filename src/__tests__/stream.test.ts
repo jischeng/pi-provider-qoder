@@ -199,6 +199,9 @@ describe("streamQoder", () => {
     const done = events.find((e) => e.type === "done");
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.responseId).toBe("chatcmpl-abc123");
+    // Assistant identity remains the model selected by Pi, while the concrete
+    // upstream route is retained separately for diagnostics.
+    expect(msg.model).toBe("ultimate");
     expect(msg.responseModel).toBe("qmodel_latest");
     expect(msg.usage.input).toBe(27);
     expect(msg.usage.output).toBe(7);

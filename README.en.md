@@ -74,6 +74,10 @@ request. This is a naming and request-mapping difference, not a difference in mo
 | `qmodel` | Qwen3.7 Plus (Qoder) |
 | `cmodel` | Cantus (Qoder) |
 | `qmodel_preview` | Qwen3.8 Max Preview (Qoder) |
+| `qmodel_38max` | Qwen3.8 Max (Qoder) |
+| `qfmodel` | Qwen3.8 Flash (Qoder) |
+| `gmodel` | GLM-5.3 (Qoder) |
+| `gfmodel` | GLM-5.3 Flash (Qoder) |
 | `qmodel_latest` | Qwen3.7 Max (Qoder) |
 | `dmodel` | DeepSeek V4 Pro (Qoder) |
 | `dfmodel` | DeepSeek V4 Flash (Qoder) |

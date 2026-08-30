@@ -40,6 +40,14 @@ describe("staticModels", () => {
     const ids = staticModels.map((m) => m.id);
     expect(new Set(ids).size).toBe(ids.length);
   });
+
+  it("keeps commonly selected dynamic models available when the cache is unreadable", () => {
+    const models = new Map(staticModels.map((model) => [model.id, model]));
+    for (const id of ["qmodel_38max", "qfmodel", "gmodel", "gfmodel"]) {
+      expect(models.has(id), `${id} should exist in the static fallback`).toBe(true);
+      expect(models.get(id)).toMatchObject({ reasoning: true, supportsEffort: true });
+    }
+  });
 });
 
 // ── staticCnModels ────────────────────────────────────────────────────────

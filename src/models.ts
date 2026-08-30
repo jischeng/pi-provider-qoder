@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -149,6 +150,58 @@ export const staticModels: QoderModelDef[] = [
   {
     id: "qmodel_preview",
     name: "Qwen3.8 Max Preview (Qoder)",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: "https://api3.qoder.sh/",
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: 1000000,
+    maxTokens: 32768,
+  },
+  {
+    id: "qmodel_38max",
+    name: "Qwen3.8 Max (Qoder)",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: "https://api3.qoder.sh/",
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: 1000000,
+    maxTokens: 32768,
+  },
+  {
+    id: "qfmodel",
+    name: "Qwen3.8 Flash (Qoder)",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: "https://api3.qoder.sh/",
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: 1000000,
+    maxTokens: 32768,
+  },
+  {
+    id: "gmodel",
+    name: "GLM-5.3 (Qoder)",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: "https://api3.qoder.sh/",
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: 1000000,
+    maxTokens: 32768,
+  },
+  {
+    id: "gfmodel",
+    name: "GLM-5.3 Flash (Qoder)",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -399,6 +452,19 @@ function withPriceFactor(model: QoderModelDef, priceFactor: number | undefined):
   };
 }
 
+function writeCacheAtomically(cachePath: string, contents: string): void {
+  // Keep the temporary file beside the destination so renameSync stays on the
+  // same filesystem and atomically replaces the previous complete cache.
+  const temporaryPath = `${cachePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, contents, { encoding: "utf-8", mode: 0o600 });
+    renameSync(temporaryPath, cachePath);
+  } finally {
+    // Covers a failed write/rename without touching the last known-good cache.
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
 export function getCachedModels(mode?: string): QoderModelDef[] {
   const cachePath = getQoderCachePath(mode);
   if (existsSync(cachePath)) {
@@ -583,6 +649,6 @@ export async function updateQoderModelsCache(
 
     const cachePath = getQoderCachePath(mode);
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify(cacheData, null, 2), "utf-8");
+    writeCacheAtomically(cachePath, JSON.stringify(cacheData, null, 2));
   } catch {}
 }
