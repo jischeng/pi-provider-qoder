@@ -102,7 +102,7 @@ interface ParsedModelCache {
 }
 
 /** In-memory cache keyed by absolute cache path (HOME-safe across tests). */
-const modelCacheMem = new Map<string, ParsedModelCache | null>();
+const modelCacheMem = new Map<string, ParsedModelCache>();
 
 /** Clear process-memory model caches (also used by tests that mutate cache files). */
 export function clearQoderModelsMemCache(): void {
@@ -111,19 +111,23 @@ export function clearQoderModelsMemCache(): void {
 
 function readParsedModelCache(mode: QoderMode): ParsedModelCache | null {
   const cachePath = getQoderCachePath(mode);
-  if (modelCacheMem.has(cachePath)) {
-    return modelCacheMem.get(cachePath) ?? null;
+  const mem = modelCacheMem.get(cachePath);
+  if (mem) {
+    return mem;
   }
   if (!existsSync(cachePath)) {
-    modelCacheMem.set(cachePath, null);
     return null;
   }
   try {
-    const data = JSON.parse(readFileSync(cachePath, "utf8")) as ParsedModelCache;
-    modelCacheMem.set(cachePath, data);
-    return data;
+    const raw = readFileSync(cachePath, "utf8");
+    if (!raw.trim()) return null;
+    const data = JSON.parse(raw) as ParsedModelCache;
+    if (data && Array.isArray(data.models) && data.models.length > 0) {
+      modelCacheMem.set(cachePath, data);
+      return data;
+    }
+    return null;
   } catch {
-    modelCacheMem.set(cachePath, null);
     return null;
   }
 }
@@ -263,6 +267,34 @@ export const staticModels: QoderModelDef[] = [
     maxTokens: MAX_OUTPUT_TOKENS,
   },
   {
+    id: "Qwen3.8-Flash",
+    upstreamKey: "qfmodel",
+    name: "Qwen3.8-Flash",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: getQoderBaseUrl("global"),
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+  },
+  {
+    id: "GLM-5.3",
+    upstreamKey: "gmodel",
+    name: "GLM-5.3",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: getQoderBaseUrl("global"),
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+  },
+  {
     id: "Qwen3.7-Max",
     upstreamKey: "qmodel_latest",
     name: "Qwen3.7-Max",
@@ -380,6 +412,51 @@ export const staticCnModels: QoderModelDef[] = [
     contextWindow: 200000,
     maxTokens: MAX_OUTPUT_TOKENS,
     description: "Qoder CN smart routing; fallback context window of 200K.",
+  },
+  {
+    id: "Qwen3.8-Max",
+    upstreamKey: "qmodel_38max",
+    name: "Qwen3.8-Max",
+    api: "qoder-api",
+    provider: "qoder-cn",
+    baseUrl: getQoderBaseUrl("cn"),
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+    description: "Qoder CN qmodel_38max; context options 200K/400K/1M.",
+  },
+  {
+    id: "Qwen3.8-Flash",
+    upstreamKey: "qfmodel",
+    name: "Qwen3.8-Flash",
+    api: "qoder-api",
+    provider: "qoder-cn",
+    baseUrl: getQoderBaseUrl("cn"),
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+    description: "Qoder CN qfmodel; context options 200K/400K/1M.",
+  },
+  {
+    id: "GLM-5.3",
+    upstreamKey: "gmodel",
+    name: "GLM-5.3",
+    api: "qoder-api",
+    provider: "qoder-cn",
+    baseUrl: getQoderBaseUrl("cn"),
+    reasoning: true,
+    supportsEffort: true,
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+    description: "Qoder CN gmodel; context options 200K/400K/1M.",
   },
   {
     id: "Qwen3.7-Max",
@@ -674,6 +751,7 @@ export async function updateQoderModelsCache(
         Accept: "application/json",
         ...headers,
       },
+      signal: AbortSignal.timeout(8000),
     });
 
     if (!response.ok) {

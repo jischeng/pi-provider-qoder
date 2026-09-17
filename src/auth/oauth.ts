@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
@@ -37,32 +38,31 @@ function getAuthFilePath(): string {
   return join(getHomeDir(), ".pi", "agent", "auth.json");
 }
 
-/** Memoized parse of auth.json; invalidated on save. undefined = not loaded. */
-let authFileMem: { path: string; data: Record<string, unknown> } | null | undefined;
+/** Memoized parse of auth.json; invalidated on save. null = not loaded. */
+let authFileMem: { path: string; data: Record<string, unknown> } | null = null;
 
 /** Clear process-memory auth caches (used by tests that mutate auth.json). */
 export function clearQoderAuthMemCache(): void {
-  authFileMem = undefined;
+  authFileMem = null;
   identityCache.clear();
 }
 
 function readAuthFileCached(): Record<string, unknown> | null {
   const authPath = getAuthFilePath();
-  if (authFileMem !== undefined) {
-    if (authFileMem === null) return null;
-    if (authFileMem.path === authPath) return authFileMem.data;
-  }
   if (!existsSync(authPath)) {
-    authFileMem = null;
     return null;
   }
   try {
-    const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
-    authFileMem = { path: authPath, data };
-    return data;
+    const raw = readFileSync(authPath, "utf-8");
+    if (!raw.trim()) return authFileMem?.data ?? null;
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    if (data && typeof data === "object") {
+      authFileMem = { path: authPath, data };
+      return data;
+    }
+    return authFileMem?.data ?? null;
   } catch {
-    authFileMem = null;
-    return null;
+    return authFileMem?.data ?? null;
   }
 }
 
@@ -89,7 +89,13 @@ function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredent
     const existing = readAuthFileCached();
     const auth: Record<string, unknown> = existing ? { ...existing } : {};
     auth[providerID] = { type: "oauth", ...credentials };
-    writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    const temporaryPath = `${authPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporaryPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+      renameSync(temporaryPath, authPath);
+    } finally {
+      rmSync(temporaryPath, { force: true });
+    }
     authFileMem = { path: authPath, data: auth };
     const q = credentials as QoderCredentials;
     if (q.access && q.userID) {

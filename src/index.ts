@@ -130,6 +130,15 @@ function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: 
   });
 }
 
+function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
+  const prefix = getQoderRegionConfig(mode).providerID;
+  for (const providerID of registeredAccountProviderIDs) {
+    if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
+      registerQoderProvider(pi, providerID, mode);
+    }
+  }
+}
+
 async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Promise<void> {
   for (let accountNumber = 1; accountNumber <= MAX_QODER_ACCOUNTS; accountNumber++) {
     if (accountNumber > 1 && !getCachedCredentials("", accountProviderID(mode, accountNumber - 1))?.access) break;
@@ -190,6 +199,7 @@ export default async function (pi: ExtensionAPI) {
           const name = creds?.name || region.userNameFallback;
           const email = creds?.email || region.userEmailFallback;
           await updateQoderModelsCache(accessToken, userID, name, email, mode);
+          reRegisterProvidersForMode(pi, mode);
           break;
         }
       } catch {
