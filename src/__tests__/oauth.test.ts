@@ -2,13 +2,34 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { updateQoderModelsCache } from "../models.js";
-import { autoLoginQoderFromEnvironment, getCachedCredentials, getQoderPatForMode } from "../oauth.js";
-import { credentialsFromPat } from "../pat.js";
+import {
+  autoLoginQoderFromEnvironment,
+  clearQoderAuthMemCache,
+  getCachedCredentials,
+  getQoderPatForMode,
+} from "../auth/oauth.js";
+import { credentialsFromPat } from "../auth/pat.js";
+import { updateQoderModelsCache } from "../catalog.js";
+import { loadLiveFixture } from "./live-fixture.js";
 
-const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
+const AUTH_FILE = join(process.env.HOME || process.env.USERPROFILE || homedir(), ".pi", "agent", "auth.json");
 
-vi.mock("../pat.js", () => ({
+const PAT_ENV_NAMES = [
+  "QODER_API_KEY",
+  "QODER_PERSONAL_ACCESS_TOKEN",
+  "QODER_PAT",
+  "QODERCN_API_KEY",
+  "QODERCN_PERSONAL_ACCESS_TOKEN",
+  "QODERCN_PAT",
+] as const;
+
+function clearPatEnv(): void {
+  for (const name of PAT_ENV_NAMES) {
+    delete process.env[name];
+  }
+}
+
+vi.mock("../auth/pat.js", () => ({
   credentialsFromPat: vi.fn().mockResolvedValue({
     access: "mock-access-token",
     refresh: "mock-refresh-token",
@@ -23,7 +44,7 @@ vi.mock("../pat.js", () => ({
   decodePatRefresh: vi.fn(),
 }));
 
-vi.mock("../models.js", () => ({
+vi.mock("../catalog.js", () => ({
   updateQoderModelsCache: vi.fn().mockResolvedValue(undefined),
   getCachedModels: vi.fn().mockReturnValue([]),
   isCacheStale: vi.fn().mockReturnValue(true),
@@ -38,6 +59,8 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env = { ...originalEnv };
+    clearPatEnv();
+    clearQoderAuthMemCache();
     originalAuth = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, "utf8") : undefined;
   });
 
@@ -45,6 +68,7 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
     process.env = originalEnv;
     if (originalAuth === undefined) rmSync(AUTH_FILE, { force: true });
     else writeFileSync(AUTH_FILE, originalAuth, "utf8");
+    clearQoderAuthMemCache();
   });
 
   it("extracts PAT correctly from env for global and CN mode", () => {
@@ -81,10 +105,6 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
   });
 
   it("does nothing if no PAT in environment", async () => {
-    delete process.env.QODER_PERSONAL_ACCESS_TOKEN;
-    delete process.env.QODER_API_KEY;
-    delete process.env.QODER_PAT;
-
     await autoLoginQoderFromEnvironment("qoder-test-provider", "global");
     expect(getCachedCredentials("mock-token", "qoder-test-provider")).toBeNull();
   });
@@ -109,6 +129,36 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
       "mock-user-123",
       "Test User",
       "test@example.com",
+      "global",
+    );
+  });
+
+  it("passes a recorded-format identity into the model catalog refresh", async () => {
+    const identity = loadLiveFixture("global").interactions.userinfo.response.body as {
+      id: string;
+      email: string;
+      name: string;
+    };
+    vi.mocked(credentialsFromPat).mockResolvedValueOnce({
+      access: "<redacted:job-token>",
+      refresh: "<redacted:refresh-token>",
+      expires: Date.now() + 3600000,
+      userID: identity.id,
+      email: identity.email,
+      name: identity.name,
+      machineID: "<redacted:machine-id>",
+      type: "oauth",
+    } as never);
+    clearPatEnv();
+    process.env.QODER_PAT = "test-only-pat";
+
+    await autoLoginQoderFromEnvironment("qoder-fixture-provider", "global");
+
+    expect(updateQoderModelsCache).toHaveBeenCalledWith(
+      "<redacted:job-token>",
+      identity.id,
+      identity.name,
+      identity.email,
       "global",
     );
   });

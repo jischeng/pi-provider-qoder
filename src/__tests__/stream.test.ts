@@ -8,7 +8,23 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { streamQoder } from "../stream.js";
+import { streamQoder } from "../protocol/stream.js";
+import { loadLiveFixture } from "./live-fixture.js";
+
+// Pin the identity so the mocked fetch below only ever serves the chat request.
+// Without a resolved identity, streamQoder fetches /userinfo first and consumes
+// the mock response, leaving the chat read to fail on a locked stream.
+vi.mock("../auth/oauth.js", () => ({
+  resolveQoderIdentity: vi.fn().mockResolvedValue({
+    access: "fake",
+    userID: "test-user",
+    email: "test@example.com",
+    name: "Test User",
+    machineID: "test-machine",
+    refresh: "",
+    expires: 0,
+  }),
+}));
 
 /**
  * Build a single SSE `data:` line carrying a Qoder envelope:
@@ -61,12 +77,7 @@ function finishChunk(finish_reason: string, extra: object = {}): object {
   };
 }
 
-const SUCCESS_SSE =
-  sseEnvelope(chunk({ role: "assistant" })) +
-  sseEnvelope(chunk({ reasoning_content: "The user wants OK.", role: "assistant" })) +
-  sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
-  sseEnvelope(finishChunk("stop")) +
-  DONE_SSE;
+const SUCCESS_SSE = loadLiveFixture("global").interactions.chat.response.body as string;
 
 const BLOCKED_SSE = sseEnvelope(
   { code: "provider_error", message: "Session blocked", request_id: "r", type: "provider_error" },
@@ -102,8 +113,8 @@ function mockFetch(body: string): typeof fetch {
   return vi.fn(async () => response) as unknown as typeof fetch;
 }
 
-function makeModel(): Model<Api> {
-  return { id: "ultimate", api: "qoder-api" as Api, provider: "qoder" } as Model<Api>;
+function makeModel(provider = "qoder", id = "Lite"): Model<Api> {
+  return { id, api: "qoder-api" as Api, provider } as Model<Api>;
 }
 
 function makeContext(): Context {
@@ -125,12 +136,15 @@ async function consume(stream: AssistantMessageEventStream): Promise<AssistantMe
 
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
+  const originalCnPat = process.env.QODERCN_PERSONAL_ACCESS_TOKEN;
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    if (originalCnPat === undefined) delete process.env.QODERCN_PERSONAL_ACCESS_TOKEN;
+    else process.env.QODERCN_PERSONAL_ACCESS_TOKEN = originalCnPat;
     vi.restoreAllMocks();
   });
 
-  it("parses a successful SSE stream into text + stop", async () => {
+  it("replays a recorded-format SSE fixture into text + stop", async () => {
     globalThis.fetch = mockFetch(SUCCESS_SSE);
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     const events = await consume(stream);
@@ -141,6 +155,50 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("stop");
     const text = msg.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text : "").toBe("OK");
+  });
+
+  it("sends the internal upstream key for a friendly model id", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    expect(init?.headers).toEqual(expect.objectContaining({ "X-Model-Key": "lite" }));
+
+    const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const encoded = Buffer.from(init?.body as Uint8Array).toString("utf8");
+    const rearranged = [...encoded]
+      .map((character) => (character === "$" ? "=" : standard[custom.indexOf(character)] || character))
+      .join("");
+    const third = Math.floor(rearranged.length / 3);
+    const base64 =
+      rearranged.slice(rearranged.length - third) +
+      rearranged.slice(third, rearranged.length - third) +
+      rearranged.slice(0, third);
+    const body = JSON.parse(Buffer.from(base64, "base64").toString("utf8")) as {
+      chat_context: { extra: { modelConfig: { key: string } } };
+      model_config: { key: string };
+    };
+    expect(body.chat_context.extra.modelConfig.key).toBe("lite");
+    expect(body.model_config.key).toBe("lite");
+  });
+
+  it("binds chat hosts to provider ids even when only a CN PAT is set", async () => {
+    process.env.QODERCN_PERSONAL_ACCESS_TOKEN = "pt-cn-only";
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder"), makeContext(), { apiKey: "fake" }));
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringMatching(/^https:\/\/api3\.qoder\.sh\//),
+      expect.any(Object),
+    );
+
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    await consume(streamQoder(makeModel("qoder-cn", "Qwen3.7-Plus"), makeContext(), { apiKey: "fake" }));
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringMatching(/^https:\/\/gateway\.qoder\.com\.cn\//),
+      expect.any(Object),
+    );
   });
 
   it("surfaces an upstream 406 'Session blocked' as an error event, not a silent stop", async () => {
@@ -199,9 +257,6 @@ describe("streamQoder", () => {
     const done = events.find((e) => e.type === "done");
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.responseId).toBe("chatcmpl-abc123");
-    // Assistant identity remains the model selected by Pi, while the concrete
-    // upstream route is retained separately for diagnostics.
-    expect(msg.model).toBe("ultimate");
     expect(msg.responseModel).toBe("qmodel_latest");
     expect(msg.usage.input).toBe(27);
     expect(msg.usage.output).toBe(7);
@@ -246,6 +301,75 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("toolUse");
     const toolCall = msg.content.find((c) => c.type === "toolCall");
     expect(toolCall).toBeDefined();
+  });
+
+  it("assembles reasoning chunks before the final answer", async () => {
+    const sse =
+      sseEnvelope(chunk({ reasoning_content: "check " })) +
+      sseEnvelope(chunk({ reasoning_content: "twice" })) +
+      sseEnvelope(chunk({ content: "done" })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake", reasoning: "high" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    expect(done.message.content).toEqual([
+      { type: "thinking", thinking: "check twice" },
+      { type: "text", text: "done" },
+    ]);
+    expect(events.map((event) => event.type)).toContain("thinking_delta");
+  });
+
+  it("assembles parallel tool calls by their stream indexes", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [
+            { index: 0, id: "call_a", function: { name: "read", arguments: '{"path":' } },
+            { index: 1, id: "call_b", function: { name: "search", arguments: '{"query":' } },
+          ],
+        }),
+      ) +
+      sseEnvelope(
+        chunk({
+          tool_calls: [
+            { index: 0, function: { arguments: '"/a"}' } },
+            { index: 1, function: { arguments: '"needle"}' } },
+          ],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    const calls = done.message.content.filter((block): block is ToolCall => block.type === "toolCall");
+
+    expect(calls).toEqual([
+      { type: "toolCall", id: "call_a", name: "read", arguments: { path: "/a" } },
+      { type: "toolCall", id: "call_b", name: "search", arguments: { query: "needle" } },
+    ]);
+  });
+
+  it("preserves text emitted before and after a tool call", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "before" })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: "{}" } }] })) +
+      sseEnvelope(chunk({ content: " after" })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+
+    expect(done.message.content).toEqual([
+      { type: "text", text: "before after" },
+      { type: "toolCall", id: "call_1", name: "lookup", arguments: {} },
+    ]);
   });
 
   it("emits a tool call that arrives with no arguments", async () => {
@@ -335,7 +459,6 @@ describe("streamQoder", () => {
     expect(events.some((event) => event.type === "error")).toBe(false);
     expect(events.some((event) => event.type === "done")).toBe(true);
   });
-
   it("finishes when the gateway sends [DONE] but keeps the body open", async () => {
     // Qoder's gateway does not always close the HTTP body after the sentinel.
     // The read loop used to keep awaiting reader.read() until the socket went
@@ -389,5 +512,30 @@ describe("streamQoder", () => {
     const msg = (done as { message: AssistantMessage }).message;
     const text = msg.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text : "").toBe("hi");
+  });
+  it("reports aborted when the request is cancelled before streaming starts", async () => {
+    const controller = new AbortController();
+    globalThis.fetch = vi.fn(
+      (_url: URL | RequestInfo, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          if (init?.signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+            once: true,
+          });
+        }),
+    ) as unknown as typeof fetch;
+
+    const eventsPromise = consume(
+      streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal }),
+    );
+    controller.abort();
+    const events = await eventsPromise;
+
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage };
+    expect(error.error.stopReason).toBe("aborted");
+    expect(events.find((event) => event.type === "done")).toBeUndefined();
   });
 });

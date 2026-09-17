@@ -1,5 +1,5 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
-import { getQoderManageUrl, getQoderMode, getQoderUsageURL, isQoderCNMode } from "./cosy.js";
+import { getQoderRegionConfig, getQoderUsageURL, type QoderMode } from "../region.js";
 
 interface QoderQuota {
   total: number;
@@ -33,7 +33,11 @@ export interface QoderProviderUsage {
   raw?: Record<string, unknown>;
 }
 
-async function fetchQoderUsageForMode(credentials: OAuthCredentials, mode: string): Promise<QoderProviderUsage> {
+export async function fetchQoderUsageForMode(
+  credentials: OAuthCredentials,
+  mode: QoderMode,
+): Promise<QoderProviderUsage> {
+  const region = getQoderRegionConfig(mode);
   const response = await fetch(getQoderUsageURL(mode), {
     method: "GET",
     headers: {
@@ -76,18 +80,10 @@ async function fetchQoderUsageForMode(credentials: OAuthCredentials, mode: strin
 
   return {
     summary: remainingText,
-    subscriptionTitle: isQoderCNMode(mode) ? "Qoder CN Plan" : "Qoder AI Plan",
+    subscriptionTitle: region.usageTitle,
     resetAt: raw.expiresAt ? new Date(raw.expiresAt).toISOString() : undefined,
-    manageUrl: getQoderManageUrl(mode),
+    manageUrl: region.manageUrl,
     usageBuckets,
     raw: raw as unknown as Record<string, unknown>,
   };
-}
-
-export async function fetchQoderUsage(credentials: OAuthCredentials): Promise<QoderProviderUsage> {
-  return fetchQoderUsageForMode(credentials, getQoderMode());
-}
-
-export async function fetchQoderUsageCN(credentials: OAuthCredentials): Promise<QoderProviderUsage> {
-  return fetchQoderUsageForMode(credentials, "cn");
 }

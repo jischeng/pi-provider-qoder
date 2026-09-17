@@ -1,29 +1,23 @@
 import crypto from "node:crypto";
-import type {
-  Api,
-  AssistantMessage,
-  AssistantMessageEventStream,
-  Context,
-  Model,
-  SimpleStreamOptions,
-  TextContent,
-  ThinkingContent,
-  ToolCall,
-} from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import {
-  buildAuthHeaders,
-  getMachineId,
-  getQoderChatURL,
-  getQoderCNDirectModel,
-  getQoderMode,
-  getQoderUserEmailFallback,
-  isQoderCNMode,
-} from "./cosy.js";
-import { getCachedModelConfig } from "./models.js";
-import { resolveQoderIdentity } from "./oauth.js";
-import { qoderEncodeBody } from "./qoder-encoding.js";
-import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
+  type Api,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  clampThinkingLevel,
+  type Model,
+  type SimpleStreamOptions,
+  type TextContent,
+  type ThinkingContent,
+  type ToolCall,
+} from "@earendil-works/pi-ai";
+import { resolveQoderIdentity } from "../auth/oauth.js";
+import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import { buildAuthHeaders, getMachineId } from "../cosy.js";
+import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
+import { qoderEncodeBody } from "./encoding.js";
+import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 
 interface ToolCallState {
@@ -242,7 +236,6 @@ async function fetchWithQueueRetry(url: string, init: RequestInit, signal?: Abor
     await waitForQueueRetry(inspected.queue.retryAfterSeconds, signal);
   }
 }
-
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -286,11 +279,12 @@ export function streamQoder(
 
   (async () => {
     try {
-      const providerMode = model.provider === "qoder-cn" ? "cn" : getQoderMode();
+      const providerMode = model.provider.startsWith("qoder-cn") ? "cn" : "global";
+      const region = getQoderRegionConfig(providerMode);
       const accessToken = options?.apiKey;
       if (!accessToken) {
         throw new Error(
-          isQoderCNMode(providerMode)
+          providerMode === "cn"
             ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN."
             : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN.",
         );
@@ -302,25 +296,20 @@ export function streamQoder(
       // it with "Login expired" (105).
       const ident = await resolveQoderIdentity(accessToken, model.provider, providerMode);
       const userID = ident.userID || "qoder-user";
-      const name = ident.name || (isQoderCNMode(providerMode) ? "Qoder CN User" : "Qoder User");
-      const email = ident.email || getQoderUserEmailFallback(providerMode);
+      const name = ident.name || region.userNameFallback;
+      const email = ident.email || region.userEmailFallback;
       const machineID = ident.machineID || getMachineId();
 
-      const qoderModel = isQoderCNMode(providerMode) ? getQoderCNDirectModel(model.id) : model.id;
-      const modelConfig = getCachedModelConfig(qoderModel, providerMode) || {
-        key: qoderModel,
-        is_reasoning:
-          qoderModel === "ultimate" ||
-          qoderModel === "performance" ||
-          qoderModel.includes("dmodel") ||
-          qoderModel.includes("dfmodel"),
-        max_output_tokens: 32768,
-        source: "system",
-      };
-      modelConfig.key = qoderModel;
+      // Both providers expose the upstream display_name (whitespace stripped)
+      // as the pi id. Read the original key from cached/static config so the
+      // gateway still receives identifiers such as `lite` or `qmodel`.
+      const modelConfig = getCachedModelConfig(model.id, providerMode);
+      if (!modelConfig?.key) {
+        throw new Error(`Unknown Qoder model id: ${model.id}`);
+      }
+      const qoderModel = modelConfig.key;
 
       const isReasoning = !!modelConfig.is_reasoning;
-      const maxOutputTokens = modelConfig.max_output_tokens || 32768;
 
       const normalizedMessages = transformMessagesForQoder(context.messages);
       // OMP may supply the system prompt as a single-element content array;
@@ -350,16 +339,50 @@ export function streamQoder(
         ? `${stablePart}-${options.sessionId}`
         : `${stablePart}-${crypto.randomUUID()}`;
 
-      let maxTokens = 32768;
-      if (maxOutputTokens > 0) {
-        maxTokens = maxOutputTokens;
-      }
+      // Qoder's catalog exposes no per-model output cap, so we use the
+      // documented upstream ceiling (MAX_OUTPUT_TOKENS = 131072, see models.ts)
+      // and let pi cap it lower when the caller sets options.maxTokens (e.g.
+      // compaction at 40K). This avoids truncating reasoning chains / long
+      // generations that the 32K default would cut off.
+      let maxTokens = MAX_OUTPUT_TOKENS;
       if (options?.maxTokens && options.maxTokens < maxTokens) {
         maxTokens = options.maxTokens;
       }
 
       const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+
+      // Map pi's thinking level (options.reasoning) to Qoder's request fields.
+      // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
+      // ("none"|"low"|"medium"|"high"|"xhigh"|"max") and `enable_thinking` (bool)
+      // inside `parameters`, alongside `max_tokens`.
+      //
+      // This mirrors the pattern the pi-ai OpenAI provider uses: clamp the
+      // requested level to what the model advertises via thinkingLevelMap, then
+      // map to the upstream effort name. clampThinkingLevel returns "off" when
+      // the level is unsupported or the user disabled thinking.
+      const requestedLevel = options?.reasoning;
+      const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
+      const reasoningLevel = clamped === "off" ? undefined : clamped;
+      const parameters: Record<string, unknown> = { max_tokens: maxTokens };
+      if (reasoningLevel) {
+        parameters.enable_thinking = true;
+        // Effort-based models advertise concrete effort names in the map
+        // (low/medium/xhigh/max). Toggle-only models map every level to
+        // "enabled"/"disabled" and accept no effort value — only the on/off
+        // switch matters, so we send enable_thinking alone.
+        const mapped = model.thinkingLevelMap?.[reasoningLevel];
+        const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
+        // Only send reasoning_effort when the upstream model actually exposes
+        // effort levels (thinking_config.enabled.efforts).
+        if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
+          parameters.reasoning_effort = effort;
+        }
+      } else {
+        // No reasoning level selected (or clamped to off): explicitly disable
+        // thinking so the model does not reason by default.
+        parameters.enable_thinking = false;
+      }
 
       const reqBody: Record<string, unknown> = {
         request_id: crypto.randomUUID(),
@@ -385,7 +408,7 @@ export function streamQoder(
         system: "",
         messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
         tools: toolsRaw || [],
-        parameters: { max_tokens: maxTokens },
+        parameters,
         chat_context: {
           chatPrompt: "",
           imageUrls: null,
@@ -413,8 +436,7 @@ export function streamQoder(
       };
 
       const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-      const encodedBody = qoderEncodeBody(bodyBytes);
-      const encodedBytes = Buffer.from(encodedBody, "utf8");
+      const encodedBytes = qoderEncodeBody(bodyBytes);
 
       const chatURL = getQoderChatURL(providerMode);
 
@@ -441,7 +463,7 @@ export function streamQoder(
             "X-Model-Source": modelSource,
             ...headers,
           },
-          body: encodedBytes,
+          body: encodedBytes as unknown as BodyInit,
           signal: options?.signal,
         },
         options?.signal,
@@ -456,6 +478,7 @@ export function streamQoder(
       if (!reader) throw new Error("No response body");
       const decoder = new TextDecoder();
       let buffer = "";
+      let bufferStart = 0;
 
       let contentBlockIndex = -1;
       let thinkingBlockIndex = -1;
@@ -477,14 +500,20 @@ export function streamQoder(
         const { done, value } = await reader.read();
         if (done) break;
 
+        // Drop consumed prefix before appending so we do not keep growing a
+        // dead head of the string across chunks.
+        if (bufferStart > 0) {
+          buffer = buffer.substring(bufferStart);
+          bufferStart = 0;
+        }
         buffer += decoder.decode(value, { stream: true });
 
         while (true) {
-          const lineEnd = buffer.indexOf("\n");
+          const lineEnd = buffer.indexOf("\n", bufferStart);
           if (lineEnd === -1) break;
 
-          const line = buffer.substring(0, lineEnd).trim();
-          buffer = buffer.substring(lineEnd + 1);
+          const line = buffer.substring(bufferStart, lineEnd).trim();
+          bufferStart = lineEnd + 1;
 
           if (!line.startsWith("data:")) continue;
 

@@ -1,6 +1,13 @@
 import crypto from "node:crypto";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import { getMachineId, getQoderMode, isQoderCNMode } from "./cosy.js";
+import { getMachineId } from "../cosy.js";
+import {
+  getQoderDeviceLoginURL,
+  getQoderDevicePollURL,
+  getQoderRegionConfig,
+  getQoderUserInfoURL,
+  type QoderMode,
+} from "../region.js";
 import { credentialsFromPat } from "./pat.js";
 
 type PromptFn = (p: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
@@ -36,17 +43,15 @@ function parseExpiresAt(s?: string, expiresInSeconds?: number): number {
   return Date.now() + 30 * 24 * 60 * 60 * 1000; // default 30 days
 }
 
-export async function interactiveLogin(
-  callbacks: OAuthLoginCallbacks,
-  mode: string = getQoderMode(),
-): Promise<OAuthCredentials> {
+export async function interactiveLogin(callbacks: OAuthLoginCallbacks, mode: QoderMode): Promise<OAuthCredentials> {
+  const region = getQoderRegionConfig(mode);
   // pi drives this via its built-in LoginDialog, which wires onPrompt/onAuth/
   // onProgress to a focused input. We must use those callbacks directly rather
   // than opening our own ctx.ui.custom surface (which would steal focus and
   // leave onPrompt unable to receive keystrokes).
   const prompt = getPrompt(callbacks);
   const pat = await prompt({
-    message: isQoderCNMode(mode)
+    message: !region.supportsBrowserLogin
       ? "Paste a Qoder CN Personal Access Token, or leave empty to cancel"
       : "Paste a Qoder Personal Access Token (pt-...), or leave empty for browser login",
     placeholder: "pt-...",
@@ -57,9 +62,9 @@ export async function interactiveLogin(
     return patLogin(callbacks, pat.trim(), mode);
   }
 
-  if (isQoderCNMode(mode)) {
+  if (!region.supportsBrowserLogin) {
     throw new Error(
-      "Qoder CN browser login is not supported here. Paste a Qoder CN PAT from https://qoder.com.cn/account/integrations or set QODERCN_PERSONAL_ACCESS_TOKEN.",
+      `Qoder CN browser login is not supported here. Paste a Qoder CN PAT from ${region.patManageUrl} or set QODERCN_PERSONAL_ACCESS_TOKEN.`,
     );
   }
 
@@ -70,14 +75,15 @@ export async function interactiveLogin(
 /** Prompt for a PAT (if not provided) and exchange it for full credentials. */
 async function patLogin(
   callbacks: OAuthLoginCallbacks,
-  providedPat?: string,
-  mode: string = getQoderMode(),
+  providedPat: string | undefined,
+  mode: QoderMode,
 ): Promise<OAuthCredentials> {
+  const region = getQoderRegionConfig(mode);
   let pat = providedPat;
   if (!pat) {
     const prompt = getPrompt(callbacks);
     const entered = await prompt({
-      message: isQoderCNMode(mode)
+      message: !region.supportsBrowserLogin
         ? "Paste your Qoder CN Personal Access Token"
         : "Paste your Qoder Personal Access Token (pt-...)",
       placeholder: "pt-...",
@@ -115,7 +121,7 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
   const nonce = crypto.randomUUID();
   const machineID = getMachineId();
 
-  const verificationURI = `https://qoder.com/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
+  const verificationURI = getQoderDeviceLoginURL(codeChallenge, machineID, nonce);
 
   getProgress(callbacks)?.("Please complete login in your browser...");
 
@@ -124,7 +130,7 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
     instructions: "Click to sign in with your Qoder account in the browser.",
   });
 
-  const pollURL = `https://openapi.qoder.sh/api/v1/deviceToken/poll?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(codeVerifier)}&challenge_method=S256`;
+  const pollURL = getQoderDevicePollURL(nonce, codeVerifier);
   const pollInterval = 2000;
   const maxAttempts = 90; // 3 minutes
 
@@ -171,7 +177,7 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
       let email = "";
       let name = "";
       try {
-        const userinfoRes = await fetch("https://openapi.qoder.sh/api/v1/userinfo", {
+        const userinfoRes = await fetch(getQoderUserInfoURL("global"), {
           method: "GET",
           headers: {
             Authorization: `Bearer ${tokenData.token}`,

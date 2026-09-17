@@ -2,10 +2,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
-import { AuthStorage } from "@earendil-works/pi-coding-agent";
-import { getMachineId, getQoderMode, getQoderRefreshURL, getQoderUserEmailFallback, isQoderCNMode } from "./cosy.js";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
+import { updateQoderModelsCache } from "../catalog.js";
+import { getMachineId } from "../cosy.js";
+import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
-import { updateQoderModelsCache } from "./models.js";
 import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
 
 export interface QoderCredentials extends OAuthCredentials {
@@ -15,51 +16,92 @@ export interface QoderCredentials extends OAuthCredentials {
   machineID: string;
 }
 
-const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
+/**
+ * `AuthStorage` is not part of every pi-coding-agent release's public exports,
+ * so it is read off the module namespace instead of imported by name: a missing
+ * export must degrade to the auth-file fallback below, not break the build.
+ */
+const AuthStorage = (
+  PiCodingAgent as unknown as {
+    AuthStorage?: { create?: () => { set: (providerID: string, credentials: unknown) => void } };
+  }
+).AuthStorage;
+
+const identityCache = new Map<string, QoderCredentials>();
+
+function getHomeDir(): string {
+  return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+
+function getAuthFilePath(): string {
+  return join(getHomeDir(), ".pi", "agent", "auth.json");
+}
+
+/** Memoized parse of auth.json; invalidated on save. undefined = not loaded. */
+let authFileMem: { path: string; data: Record<string, unknown> } | null | undefined;
+
+/** Clear process-memory auth caches (used by tests that mutate auth.json). */
+export function clearQoderAuthMemCache(): void {
+  authFileMem = undefined;
+  identityCache.clear();
+}
+
+function readAuthFileCached(): Record<string, unknown> | null {
+  const authPath = getAuthFilePath();
+  if (authFileMem !== undefined) {
+    if (authFileMem === null) return null;
+    if (authFileMem.path === authPath) return authFileMem.data;
+  }
+  if (!existsSync(authPath)) {
+    authFileMem = null;
+    return null;
+  }
+  try {
+    const data = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+    authFileMem = { path: authPath, data };
+    return data;
+  } catch {
+    authFileMem = null;
+    return null;
+  }
+}
 
 /** Return the PAT exposed through the environment for a provider mode. */
-export function getQoderPatForMode(mode: string, providerID = "qoder"): string {
+export function getQoderPatForMode(mode: QoderMode, providerID = "qoder"): string {
   const accountMatch = /-(\d+)$/.exec(providerID);
   const accountNumber = accountMatch ? Number(accountMatch[1]) : 1;
   const suffix = accountNumber > 1 ? `_${accountNumber}` : "";
 
-  if (isQoderCNMode(mode)) {
-    return (
-      process.env[`QODERCN_API_KEY${suffix}`] ||
-      process.env[`QODERCN_PERSONAL_ACCESS_TOKEN${suffix}`] ||
-      process.env[`QODERCN_PAT${suffix}`] ||
-      ""
-    );
+  for (const envName of getQoderRegionConfig(mode).patEnvNames) {
+    const value = process.env[`${envName}${suffix}`];
+    if (value) return value;
   }
-  return (
-    process.env[`QODER_API_KEY${suffix}`] ||
-    process.env[`QODER_PERSONAL_ACCESS_TOKEN${suffix}`] ||
-    process.env[`QODER_PAT${suffix}`] ||
-    ""
-  );
+  return "";
 }
 
 function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredentials): void {
   try {
-    const dir = dirname(AUTH_FILE);
+    const authPath = getAuthFilePath();
+    const dir = dirname(authPath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    let auth: Record<string, unknown> = {};
-    if (existsSync(AUTH_FILE)) {
-      try {
-        auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-      } catch {}
-    }
+    const existing = readAuthFileCached();
+    const auth: Record<string, unknown> = existing ? { ...existing } : {};
     auth[providerID] = { type: "oauth", ...credentials };
-    writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    writeFileSync(authPath, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+    authFileMem = { path: authPath, data: auth };
+    const q = credentials as QoderCredentials;
+    if (q.access && q.userID) {
+      identityCache.set(`${providerID}:${q.access}`, q);
+    }
   } catch (err) {
     console.error(`[pi-provider-qoder] Failed to write auth storage for ${providerID}:`, err);
   }
 }
 
 /** Exchange an environment PAT before pi resolves its initial model. */
-export async function autoLoginQoderFromEnvironment(providerID: string, mode: string): Promise<void> {
+export async function autoLoginQoderFromEnvironment(providerID: string, mode: QoderMode): Promise<void> {
   const pat = getQoderPatForMode(mode, providerID);
   if (!pat) return;
 
@@ -69,7 +111,7 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: st
   // account's credentials.
   const credentials = await credentialsFromPat(pat, mode);
 
-  if (typeof AuthStorage !== "undefined" && typeof AuthStorage?.create === "function") {
+  if (typeof AuthStorage?.create === "function") {
     try {
       const authStorage = AuthStorage.create();
       authStorage.set(providerID, { type: "oauth", ...credentials });
@@ -95,47 +137,41 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: st
  * This is best-effort and falls back to null so callers can use placeholders.
  */
 export function getCachedCredentials(_accessToken: string, providerID = "qoder"): QoderCredentials | null {
-  if (existsSync(AUTH_FILE)) {
-    try {
-      const auth = JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-      const creds = auth?.[providerID] || (providerID === "qoder" ? auth?.qoder : null);
-      if (creds?.userID || creds?.access) {
-        return creds as QoderCredentials;
-      }
-    } catch {}
+  const auth = readAuthFileCached();
+  if (!auth) return null;
+  const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
+  if (creds?.userID || creds?.access) {
+    if (creds.access && creds.userID) {
+      identityCache.set(`${providerID}:${creds.access}`, creds);
+    }
+    return creds;
   }
   return null;
 }
 
-const identityCache = new Map<string, QoderCredentials>();
-
-/**
- * Resolve the Qoder identity (userID/email/name/machineID) for a chat request.
- * OMP (17.x) persists login credentials in its own agent.db, not in
- * ~/.pi/agent/auth.json, so the provider-side cache is frequently empty and the
- * COSY payload would fall back to uid "qoder-user" -> Qoder CN rejects it with
- * "Login expired" (105). Fetch the identity from the job token when the cache
- * misses (in-memory cached), and persist it so later requests skip the fetch.
- */
 export async function resolveQoderIdentity(
   accessToken: string,
   providerID: string,
-  mode: string,
+  mode: QoderMode,
 ): Promise<QoderCredentials> {
-  const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) return cached;
-
+  const region = getQoderRegionConfig(mode);
   const cacheKey = `${providerID}:${accessToken}`;
   const mem = identityCache.get(cacheKey);
   if (mem?.userID) return mem;
+
+  const cached = getCachedCredentials(accessToken, providerID);
+  if (cached?.userID) {
+    identityCache.set(cacheKey, cached);
+    return cached;
+  }
 
   const info = await fetchUserInfo(accessToken, mode);
   const machineID = getMachineId();
   const creds: QoderCredentials = {
     access: accessToken,
     userID: info.userID || "qoder-user",
-    email: info.email || getQoderUserEmailFallback(mode),
-    name: info.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User"),
+    email: info.email || region.userEmailFallback,
+    name: info.name || region.userNameFallback,
     machineID,
     refresh: "",
     expires: 0,
@@ -145,10 +181,10 @@ export async function resolveQoderIdentity(
   return creds;
 }
 
-async function loginQoderForMode(
+export async function loginQoderForMode(
   callbacks: OAuthLoginCallbacks,
-  mode: string,
-  providerID = isQoderCNMode(mode) ? "qoder-cn" : "qoder",
+  mode: QoderMode,
+  providerID: string = getQoderRegionConfig(mode).providerID,
   onLogin?: (providerID: string) => void,
 ): Promise<OAuthCredentials> {
   // 1. Try environment variables first (PAT). A PAT (pt-...) must be exchanged
@@ -196,33 +232,16 @@ async function loginQoderForMode(
 export async function loginQoderForProvider(
   callbacks: OAuthLoginCallbacks,
   providerID: string,
-  mode: string,
+  mode: QoderMode,
   onLogin?: (providerID: string) => void,
 ): Promise<OAuthCredentials> {
   return loginQoderForMode(callbacks, mode, providerID, onLogin);
 }
 
-export async function loginQoder(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  return loginQoderForMode(callbacks, getQoderMode(), "qoder");
-}
-
-export async function loginQoder2(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  return loginQoderForMode(callbacks, getQoderMode(), "qoder-2");
-}
-
-export async function loginQoderCN(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  return loginQoderForMode(callbacks, "cn", "qoder-cn");
-}
-
-export async function refreshQoderToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  return refreshQoderTokenForMode(credentials, getQoderMode());
-}
-
-export async function refreshQoderTokenCN(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  return refreshQoderTokenForMode(credentials, "cn");
-}
-
-async function refreshQoderTokenForMode(credentials: OAuthCredentials, mode: string): Promise<OAuthCredentials> {
+export async function refreshQoderTokenForMode(
+  credentials: OAuthCredentials,
+  mode: QoderMode,
+): Promise<OAuthCredentials> {
   // PAT-based credentials: re-exchange the stored PAT for a fresh job token.
   if (isPatRefresh(credentials.refresh)) {
     const { pat } = decodePatRefresh(credentials.refresh);
