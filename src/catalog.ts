@@ -289,6 +289,38 @@ export const staticModels: QoderModelDef[] = [
     baseUrl: getQoderBaseUrl("global"),
     reasoning: true,
     supportsEffort: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+  },
+  {
+    id: "GLM-5.3-Flash",
+    upstreamKey: "gfmodel",
+    name: "GLM-5.3-Flash",
+    api: "qoder-api",
+    provider: "qoder",
+    baseUrl: getQoderBaseUrl("global"),
+    reasoning: true,
+    supportsEffort: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
     input: ["text", "image"],
     cost: ZERO_COST,
     contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -452,11 +484,44 @@ export const staticCnModels: QoderModelDef[] = [
     baseUrl: getQoderBaseUrl("cn"),
     reasoning: true,
     supportsEffort: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
     input: ["text", "image"],
     cost: ZERO_COST,
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     maxTokens: MAX_OUTPUT_TOKENS,
     description: "Qoder CN gmodel; context options 200K/400K/1M.",
+  },
+  {
+    id: "GLM-5.3-Flash",
+    upstreamKey: "gfmodel",
+    name: "GLM-5.3-Flash",
+    api: "qoder-api",
+    provider: "qoder-cn",
+    baseUrl: getQoderBaseUrl("cn"),
+    reasoning: true,
+    supportsEffort: true,
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
+    input: ["text", "image"],
+    cost: ZERO_COST,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: MAX_OUTPUT_TOKENS,
+    description: "Qoder CN gfmodel; always-on reasoning, efforts high/max.",
   },
   {
     id: "Qwen3.7-Max",
@@ -603,7 +668,7 @@ const PI_THINKING_LEVELS: readonly ThinkingLevel[] = ["minimal", "low", "medium"
  * Returns undefined for models that do not support thinking, so pi falls back
  * to `reasoning: false`-style behavior (only `off`).
  */
-function buildThinkingLevelMap(entry: QoderModelEntry): ThinkingLevelMap | undefined {
+export function buildThinkingLevelMap(entry: QoderModelEntry): ThinkingLevelMap | undefined {
   const tc = entry.thinking_config;
   if (!tc) return undefined;
   const efforts = tc.enabled?.efforts;
@@ -633,16 +698,21 @@ export function getCachedModels(mode: QoderMode): QoderModelDef[] {
   const data = readParsedModelCache(mode);
   if (data && Array.isArray(data.models)) {
     const models = data.models.map((model: QoderModelDef) => {
-      const config = data.configs?.[model.id] as QoderModelEntry | undefined;
+      const config = (data.configs?.[model.id] ??
+        Object.values(data.configs || {}).find(
+          (entry) =>
+            entry && typeof entry === "object" && toQoderModelId((entry as QoderModelEntry).display_name) === model.id,
+        )) as QoderModelEntry | undefined;
       const display = config?.display_name;
       const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((seed) => seed.upstreamKey === model.id);
+      const thinkingLevelMap = model.thinkingLevelMap ?? (config ? buildThinkingLevelMap(config) : undefined);
       const baseModel = display
-        ? { ...model, id: toQoderModelId(display), name: display }
+        ? { ...model, id: toQoderModelId(display), name: display, thinkingLevelMap }
         : staticModel
-          ? { ...model, id: staticModel.id, name: staticModel.name }
+          ? { ...model, id: staticModel.id, name: staticModel.name, thinkingLevelMap }
           : model.name
-            ? { ...model, id: toQoderModelId(model.name) }
-            : model;
+            ? { ...model, id: toQoderModelId(model.name), thinkingLevelMap }
+            : { ...model, thinkingLevelMap };
       const priceFactor = model.priceFactor ?? getPriceFactor(config?.price_factor);
       return withPriceFactor(baseModel, priceFactor);
     });
@@ -676,10 +746,29 @@ export function getCachedModelConfig(modelId: string, mode: QoderMode): QoderMod
 
   const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((model) => model.id === modelId);
   if (staticModel) {
+    const thinkingConfig = staticModel.thinkingLevelMap
+      ? {
+          enabled: {
+            efforts: Object.fromEntries(
+              Object.entries(staticModel.thinkingLevelMap)
+                .filter(([k, v]) => k !== "off" && typeof v === "string")
+                .map(([_, v]) => [v, { is_default: v === "max" || v === "high" }]),
+            ),
+            is_default: true,
+          },
+          disabled: staticModel.thinkingLevelMap.off !== null ? {} : undefined,
+        }
+      : staticModel.reasoning
+        ? {
+            enabled: { is_default: true },
+          }
+        : undefined;
+
     return {
       key: staticModel.upstreamKey || modelId,
       is_reasoning: staticModel.reasoning,
       source: "system",
+      thinking_config: thinkingConfig,
     };
   }
 

@@ -15,6 +15,15 @@ for (let i = 0; i < qoderStdAlphabet.length; i++) {
 // Qoder uses "$" instead of standard Base64 "=" padding.
 encodeTable["=".charCodeAt(0)] = "$".charCodeAt(0);
 
+const decodeTable = new Uint8Array(256);
+for (let i = 0; i < decodeTable.length; i++) {
+  decodeTable[i] = i;
+}
+for (let i = 0; i < qoderCustomAlphabet.length; i++) {
+  decodeTable[qoderCustomAlphabet.charCodeAt(i)] = qoderStdAlphabet.charCodeAt(i);
+}
+decodeTable["$".charCodeAt(0)] = "=".charCodeAt(0);
+
 /**
  * Encode a request body with Qoder's custom Base64 alphabet and block reorder.
  * Returns a Buffer of ASCII bytes identical to the previous string encoding.
@@ -46,4 +55,29 @@ export function qoderEncodeBody(plaintext: string | Buffer): Buffer {
   }
 
   return out;
+}
+
+/**
+ * Decode a body previously encoded by `qoderEncodeBody`.
+ */
+export function qoderDecodeBody(encoded: string | Buffer): Buffer {
+  const enc = typeof encoded === "string" ? Buffer.from(encoded, "ascii") : encoded;
+  const n = enc.length;
+  if (n === 0) return Buffer.alloc(0);
+  const a = Math.floor(n / 3);
+
+  const stdBytes = Buffer.allocUnsafe(n);
+  let dst = 0;
+
+  for (let i = n - a; i < n; i++) {
+    stdBytes[dst++] = decodeTable[enc[i]];
+  }
+  for (let i = a; i < n - a; i++) {
+    stdBytes[dst++] = decodeTable[enc[i]];
+  }
+  for (let i = 0; i < a; i++) {
+    stdBytes[dst++] = decodeTable[enc[i]];
+  }
+
+  return Buffer.from(stdBytes.toString("ascii"), "base64");
 }

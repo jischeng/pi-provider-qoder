@@ -13,7 +13,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { resolveQoderIdentity } from "../auth/oauth.js";
-import { getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import { buildThinkingLevelMap, getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
@@ -362,21 +362,52 @@ export function streamQoder(
       // map to the upstream effort name. clampThinkingLevel returns "off" when
       // the level is unsupported or the user disabled thinking.
       const requestedLevel = options?.reasoning;
-      const clamped = requestedLevel ? clampThinkingLevel(model, requestedLevel) : undefined;
+      const effectiveModel: Model<Api> =
+        model.thinkingLevelMap || !modelConfig
+          ? model
+          : { ...model, thinkingLevelMap: buildThinkingLevelMap(modelConfig) };
+
+      const clamped = requestedLevel ? clampThinkingLevel(effectiveModel, requestedLevel) : undefined;
       const reasoningLevel = clamped === "off" ? undefined : clamped;
       const parameters: Record<string, unknown> = { max_tokens: maxTokens };
+
+      const tc = modelConfig?.thinking_config;
+      const efforts = tc?.enabled?.efforts;
+      const isAlwaysThinking = isReasoning && !!tc?.enabled && !tc.disabled;
+
       if (reasoningLevel) {
         parameters.enable_thinking = true;
         // Effort-based models advertise concrete effort names in the map
         // (low/medium/xhigh/max). Toggle-only models map every level to
         // "enabled"/"disabled" and accept no effort value — only the on/off
         // switch matters, so we send enable_thinking alone.
-        const mapped = model.thinkingLevelMap?.[reasoningLevel];
-        const effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
+        const mapped = effectiveModel.thinkingLevelMap?.[reasoningLevel];
+        let effort = mapped && mapped !== "enabled" && mapped !== "disabled" ? mapped : reasoningLevel;
         // Only send reasoning_effort when the upstream model actually exposes
         // effort levels (thinking_config.enabled.efforts).
-        if (modelConfig?.thinking_config?.enabled?.efforts && typeof effort === "string") {
+        if (efforts && typeof efforts === "object") {
+          const supportedEfforts = Object.keys(efforts);
+          if (!supportedEfforts.includes(effort as string)) {
+            // Pick default effort if marked, or fallback to supported effort
+            const defaultEffort =
+              Object.entries(efforts).find(([_, v]) => (v as { is_default?: boolean })?.is_default)?.[0] ||
+              supportedEfforts[supportedEfforts.length - 1];
+            effort = defaultEffort;
+          }
           parameters.reasoning_effort = effort;
+        }
+      } else if (isAlwaysThinking) {
+        // Upstream model enforces always-on thinking (e.g. GLM-5.3-Flash, error 1210).
+        // If the user requested "off" or level was clamped to off, keep thinking enabled
+        // using the model's default effort rather than triggering an upstream 400.
+        parameters.enable_thinking = true;
+        if (efforts && typeof efforts === "object") {
+          const defaultEffort =
+            Object.entries(efforts).find(([_, v]) => (v as { is_default?: boolean })?.is_default)?.[0] ||
+            Object.keys(efforts)[0];
+          if (defaultEffort) {
+            parameters.reasoning_effort = defaultEffort;
+          }
         }
       } else {
         // No reasoning level selected (or clamped to off): explicitly disable

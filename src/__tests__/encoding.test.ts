@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { qoderEncodeBody } from "../protocol/encoding.js";
+import { qoderDecodeBody, qoderEncodeBody } from "../protocol/encoding.js";
 
 /** Reference encoder matching the pre-Buffer string implementation (byte-identical). */
 function qoderEncodeBodyLegacyString(plaintext: string | Buffer): string {
@@ -101,6 +101,23 @@ describe("qoderEncodeBody", () => {
       const next = qoderEncodeBody(sample).toString("ascii");
       const legacy = qoderEncodeBodyLegacyString(sample);
       expect(next).toBe(legacy);
+    }
+  });
+
+  it("decodes encoded bodies back to original bytes", () => {
+    const samples = [
+      "",
+      "a",
+      "hello world",
+      "The quick brown fox jumps over the lazy dog",
+      JSON.stringify({ messages: [{ role: "user", content: "hello" }], parameters: { reasoning_effort: "high" } }),
+      Buffer.from([0x00, 0xff, 0x80, 0x7f, 0x01]),
+    ];
+    for (const sample of samples) {
+      const encoded = qoderEncodeBody(sample);
+      const decoded = qoderDecodeBody(encoded);
+      const expected = Buffer.isBuffer(sample) ? sample : Buffer.from(sample);
+      expect(decoded.equals(expected)).toBe(true);
     }
   });
 });

@@ -8,6 +8,7 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { qoderDecodeBody } from "../protocol/encoding.js";
 import { streamQoder } from "../protocol/stream.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
@@ -537,5 +538,45 @@ describe("streamQoder", () => {
     const error = events.find((event) => event.type === "error") as { error: AssistantMessage };
     expect(error.error.stopReason).toBe("aborted");
     expect(events.find((event) => event.type === "done")).toBeUndefined();
+  });
+
+  it("clamps and falls back unsupported reasoning effort to a valid upstream effort", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    // Request GLM-5.3-Flash with medium (upstream only supports high / max)
+    const stream = streamQoder(makeModel("qoder", "GLM-5.3-Flash"), makeContext(), {
+      apiKey: "fake",
+      reasoning: "medium",
+    });
+    await consume(stream);
+
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    const decoded = qoderDecodeBody(Buffer.from(init?.body as Uint8Array)).toString("utf8");
+    const parsed = JSON.parse(decoded) as {
+      parameters: { enable_thinking: boolean; reasoning_effort?: string };
+    };
+
+    expect(parsed.parameters.enable_thinking).toBe(true);
+    // Must NOT send "medium"; must fallback to a valid effort like "high" or "max"
+    expect(parsed.parameters.reasoning_effort).not.toBe("medium");
+    expect(["high", "max"]).toContain(parsed.parameters.reasoning_effort);
+  });
+
+  it("keeps thinking enabled with valid effort for always-thinking models when off is requested", async () => {
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+    const stream = streamQoder(makeModel("qoder", "GLM-5.3-Flash"), makeContext(), {
+      apiKey: "fake",
+      reasoning: "off" as unknown as "high",
+    });
+    await consume(stream);
+
+    const init = vi.mocked(globalThis.fetch).mock.calls[0][1];
+    const decoded = qoderDecodeBody(Buffer.from(init?.body as Uint8Array)).toString("utf8");
+    const parsed = JSON.parse(decoded) as {
+      parameters: { enable_thinking: boolean; reasoning_effort?: string };
+    };
+
+    // GLM-5.3-Flash is always-on; cannot disable thinking without causing error 1210
+    expect(parsed.parameters.enable_thinking).toBe(true);
+    expect(["high", "max"]).toContain(parsed.parameters.reasoning_effort);
   });
 });
