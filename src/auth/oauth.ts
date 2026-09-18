@@ -38,6 +38,37 @@ function getAuthFilePath(): string {
   return join(getHomeDir(), ".pi", "agent", "auth.json");
 }
 
+function getMultiAuthFilePath(): string {
+  return join(getHomeDir(), ".pi", "agent", "multiprovider-auth.json");
+}
+
+function readMultiAuthCredentials(accessToken?: string, providerID = "qoder"): QoderCredentials | null {
+  const multiAuthPath = getMultiAuthFilePath();
+  if (!existsSync(multiAuthPath)) return null;
+  try {
+    const raw = readFileSync(multiAuthPath, "utf-8");
+    if (!raw.trim()) return null;
+    const data = JSON.parse(raw) as {
+      providers?: Record<string, { accounts?: Array<{ credential?: Record<string, unknown> }> }>;
+    };
+    const pool = data?.providers?.[providerID];
+    if (!pool?.accounts || !Array.isArray(pool.accounts)) return null;
+
+    if (accessToken) {
+      const match = pool.accounts.find((acc) => acc.credential?.access === accessToken);
+      if (match?.credential?.userID) {
+        return match.credential as unknown as QoderCredentials;
+      }
+    } else {
+      const first = pool.accounts.find((acc) => acc.credential?.userID || acc.credential?.access);
+      if (first?.credential) {
+        return first.credential as unknown as QoderCredentials;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 /** Memoized parse of auth.json; invalidated on save. null = not loaded. */
 let authFileMem: { path: string; data: Record<string, unknown> } | null = null;
 
@@ -136,22 +167,42 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
 
 /**
  * Read the Qoder identity (userID/email/name/machineID) from pi's own auth
- * store. pi persists the full OAuthCredentials there on login/refresh and keeps
- * it up to date, so there is no need to maintain a separate credentials cache.
+ * store or multiprovider-auth.json. pi persists the full OAuthCredentials there
+ * on login/refresh and keeps it up to date.
+ *
+ * When accessToken is specified, it strictly checks that the cached access
+ * matches to prevent identity confusion across pooled accounts.
  *
  * Note: the auth.json path/shape is a pi internal convention, not a public API.
  * This is best-effort and falls back to null so callers can use placeholders.
  */
-export function getCachedCredentials(_accessToken: string, providerID = "qoder"): QoderCredentials | null {
-  const auth = readAuthFileCached();
-  if (!auth) return null;
-  const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
-  if (creds?.userID || creds?.access) {
-    if (creds.access && creds.userID) {
-      identityCache.set(`${providerID}:${creds.access}`, creds);
-    }
-    return creds;
+export function getCachedCredentials(accessToken?: string, providerID = "qoder"): QoderCredentials | null {
+  if (accessToken) {
+    const mem = identityCache.get(`${providerID}:${accessToken}`);
+    if (mem?.userID) return mem;
   }
+
+  const auth = readAuthFileCached();
+  if (auth) {
+    const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
+    if (creds?.userID || creds?.access) {
+      if (creds.access && creds.userID) {
+        identityCache.set(`${providerID}:${creds.access}`, creds);
+      }
+      if (!accessToken || creds.access === accessToken) {
+        return creds;
+      }
+    }
+  }
+
+  const multiCreds = readMultiAuthCredentials(accessToken, providerID);
+  if (multiCreds) {
+    if (multiCreds.access && multiCreds.userID) {
+      identityCache.set(`${providerID}:${multiCreds.access}`, multiCreds);
+    }
+    return multiCreds;
+  }
+
   return null;
 }
 
@@ -183,7 +234,16 @@ export async function resolveQoderIdentity(
     expires: 0,
   };
   identityCache.set(cacheKey, creds);
-  saveCredentialsToAuthFile(providerID, creds);
+
+  // Only persist to auth.json if the entry matches this account or there is no
+  // other valid account stored, avoiding clobbering main account credentials.
+  const existing = readAuthFileCached();
+  const currentSaved = (existing?.[providerID] ||
+    (providerID === "qoder" ? existing?.qoder : null)) as QoderCredentials | null;
+  if (!currentSaved || currentSaved.access === accessToken) {
+    saveCredentialsToAuthFile(providerID, creds);
+  }
+
   return creds;
 }
 
