@@ -961,6 +961,22 @@ export function getCachedModelConfig(modelId: string, mode: QoderMode): QoderMod
   return null;
 }
 
+/**
+ * Resolve model config with fallback for raw upstream keys or legacy aliases
+ * (e.g. gfmodel -> GLM-5.3-Flash, dfmodel -> DeepSeek-V4-Flash).
+ */
+export function resolveModelConfig(modelId: string, mode: QoderMode): QoderModelEntry | null {
+  const direct = getCachedModelConfig(modelId, mode);
+  if (direct) return direct;
+
+  const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((model) => model.upstreamKey === modelId);
+  if (staticModel) {
+    return getCachedModelConfig(staticModel.id, mode);
+  }
+
+  return null;
+}
+
 /** Resolve contextWindow from a catalog entry. Exported for tests. */
 export function contextWindowFromCatalog(entry: QoderModelEntry): number {
   const contextConfig = entry.context_config;

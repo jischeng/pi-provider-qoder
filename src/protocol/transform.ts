@@ -102,7 +102,24 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       continue;
     }
 
-    if (msg.role === "user") {
+    if ((msg as any).role === "system") {
+      let text = getContentText(msg);
+      const sections = (msg as any).sections;
+      if (sections && typeof sections === "object") {
+        const sectionTexts = Object.values(sections).filter(
+          (s): s is string => typeof s === "string" && s.trim().length > 0,
+        );
+        if (sectionTexts.length > 0) {
+          text = text ? `${text}\n\n${sectionTexts.join("\n\n")}` : sectionTexts.join("\n\n");
+        }
+      }
+      if (text.trim()) {
+        normalizedMessages.push({
+          role: "system",
+          content: text,
+        });
+      }
+    } else if (msg.role === "user") {
       let content: QoderContent = "";
       if (typeof msg.content === "string") {
         content = msg.content;

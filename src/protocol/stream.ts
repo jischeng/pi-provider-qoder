@@ -13,7 +13,13 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { resolveQoderIdentity } from "../auth/oauth.js";
-import { buildThinkingLevelMap, checkAccountEntitlement, getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import {
+  buildThinkingLevelMap,
+  checkAccountEntitlement,
+  getCachedModelConfig,
+  resolveModelConfig,
+  MAX_OUTPUT_TOKENS,
+} from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
@@ -303,7 +309,7 @@ export function streamQoder(
       // Both providers expose the upstream display_name (whitespace stripped)
       // as the pi id. Read the original key from cached/static config so the
       // gateway still receives identifiers such as `lite` or `qmodel`.
-      const modelConfig = getCachedModelConfig(model.id, providerMode);
+      const modelConfig = resolveModelConfig(model.id, providerMode);
       if (!modelConfig?.key) {
         throw new Error(`Unknown Qoder model id: ${model.id}`);
       }
@@ -333,10 +339,28 @@ export function streamQoder(
       // "Execution failed: set property ... MessagesInputDto#content". Normalize.
       const systemText = contentToText(context.systemPrompt || "");
 
+      const finalMessages: ReturnType<typeof transformMessagesForQoder> = [];
+      let combinedSystemPrompt = systemText;
+
+      for (const msg of normalizedMessages) {
+        if (msg.role === "system") {
+          const sysContent = typeof msg.content === "string" ? msg.content : "";
+          if (sysContent) {
+            combinedSystemPrompt = combinedSystemPrompt ? `${combinedSystemPrompt}\n\n${sysContent}` : sysContent;
+          }
+        } else {
+          finalMessages.push(msg);
+        }
+      }
+
+      if (combinedSystemPrompt) {
+        finalMessages.unshift({ role: "system", content: combinedSystemPrompt });
+      }
+
       let lastUserText = "";
-      for (let i = normalizedMessages.length - 1; i >= 0; i--) {
-        if (normalizedMessages[i].role === "user") {
-          const content = normalizedMessages[i].content;
+      for (let i = finalMessages.length - 1; i >= 0; i--) {
+        if (finalMessages[i].role === "user") {
+          const content = finalMessages[i].content;
           lastUserText =
             typeof content === "string"
               ? content
@@ -366,7 +390,7 @@ export function streamQoder(
       }
 
       const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
-      const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
+      const recordID = stableChatRecordID(qoderModel, finalMessages, toolsRaw, maxTokens);
 
       // Map pi's thinking level (options.reasoning) to Qoder's request fields.
       // Confirmed from @qoder-ai/qodercli: the chat body carries `reasoning_effort`
@@ -453,7 +477,7 @@ export function streamQoder(
         // model never sees it). Inject the system prompt as a leading
         // role:system message instead, which the server does honor.
         system: "",
-        messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
+        messages: finalMessages,
         tools: toolsRaw || [],
         parameters,
         chat_context: {
@@ -686,10 +710,29 @@ export function streamQoder(
 
                 // 3. Process tool calls
                 if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                  if (thinkingBlockIndex !== -1) {
+                    const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                    stream.push({
+                      type: "thinking_end",
+                      contentIndex: thinkingBlockIndex,
+                      content: block.thinking,
+                      partial: output,
+                    });
+                    thinkingBlockIndex = -1;
+                  }
+                  if (thinkingParser) {
+                    thinkingParser.finalize();
+                  }
+
                   for (const tc of delta.tool_calls) {
                     const idx = tc.index ?? 0;
                     if (!toolCallsState[idx]) {
-                      toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                      toolCallsState[idx] = {
+                        arguments: "",
+                        id: tc.id || "",
+                        name: "",
+                        contentIndex: 0,
+                      };
                     }
                     const state = toolCallsState[idx];
                     if (tc.id) state.id = tc.id;
@@ -706,6 +749,7 @@ export function streamQoder(
                     // and the turn simply ended, mid-task and without an error.
                     if (state.emittedStart === undefined && (state.id || state.name)) {
                       state.emittedStart = true;
+                      if (!state.id) state.id = `call_${crypto.randomUUID().slice(0, 8)}`;
                       state.contentIndex = output.content.length;
                       output.content.push({
                         type: "toolCall",
