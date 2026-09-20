@@ -3,6 +3,7 @@ import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-age
 import {
   autoLoginQoderFromEnvironment,
   getCachedCredentials,
+  listQoderAccounts,
   loginQoderForProvider,
   refreshQoderTokenForMode,
 } from "./auth/oauth.js";
@@ -10,7 +11,10 @@ import { fetchQoderUsageForMode } from "./auth/usage.js";
 import {
   addPriceFactorToName,
   getCachedModels,
-  isCacheStale,
+  hasCachedCatalog,
+  isAccountCatalogStale,
+  qoderAccountKey,
+  qoderCatalogCacheSignature,
   staticCnModels,
   staticModels,
   updateQoderModelsCache,
@@ -145,8 +149,9 @@ async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Pr
 
     const providerID = accountProviderID(mode, accountNumber);
     try {
+      // PAT-based logins exchange the token and refresh the catalogue here;
+      // that path stays awaited so `pi --list-models` has data immediately.
       await autoLoginQoderFromEnvironment(providerID, mode);
-      await refreshModelsAtStartup(mode, providerID);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
@@ -155,19 +160,83 @@ async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Pr
     registerAccountProvider(pi, accountNumber, mode);
     if (!getCachedCredentials("", providerID)?.access) break;
   }
+
+  // Register from whatever catalogue is already on disk, then refresh in the
+  // background. Blocking registration on a network round-trip delayed the
+  // provider (and therefore every qoder model) by seconds on slow networks.
+  if (hasCachedCatalog(mode)) {
+    void refreshAccountCatalogs(mode)
+      .then((changed) => {
+        if (changed) reRegisterProvidersForMode(pi, mode);
+      })
+      .catch(() => {});
+    return;
+  }
+
+  const changed = await refreshAccountCatalogs(mode);
+  if (changed) reRegisterProvidersForMode(pi, mode);
 }
 
-async function refreshModelsAtStartup(mode: QoderMode, providerID?: string): Promise<void> {
-  const targetProviderID = providerID || getQoderRegionConfig(mode).providerID;
-  if (!isCacheStale(mode)) return;
+/**
+ * Refresh the catalogue of every Qoder account known for a region.
+ *
+ * `/model/list` is account-scoped: a free-plan or quota-exhausted account only
+ * answers with its `is_free` models. Refreshing just the single account found
+ * in auth.json let that degraded answer decide the whole picker, while a funded
+ * account's full catalogue (or the pool's other accounts) was never queried.
+ */
+async function refreshAccountCatalogs(mode: QoderMode): Promise<boolean> {
+  const region = getQoderRegionConfig(mode);
+  let changed = false;
 
-  const credentials = getCachedCredentials("", targetProviderID);
-  if (!credentials?.access) return;
+  for (const account of listQoderAccounts(mode)) {
+    if (!account.access) continue;
+    if (account.expires !== undefined && account.expires <= Date.now()) continue;
+    if (!isAccountCatalogStale(mode, account.key)) continue;
+
+    try {
+      const updated = await updateQoderModelsCache(
+        account.access,
+        account.userID || "qoder-user",
+        account.name || region.userNameFallback,
+        account.email || region.userEmailFallback,
+        mode,
+      );
+      changed = updated || changed;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[pi-provider-qoder] Catalogue refresh failed for ${account.email || account.key}: ${message}`);
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * Fallback refresh for hosts that keep credentials outside auth.json (OMP
+ * stores them in its own agent db): ask pi for the resolved token instead of
+ * reading the files ourselves. Tokens that cannot be mapped back to a real
+ * identity are skipped, because Qoder answers the placeholder identity with
+ * 403 `Login expired`.
+ */
+async function refreshAccountFromRegistry(
+  mode: QoderMode,
+  ctx: { modelRegistry: { getApiKeyForProvider: (providerID: string) => Promise<string | undefined> } },
+): Promise<boolean> {
+  const providerID = accountProviderID(mode, 1);
+  const accessToken = await ctx.modelRegistry.getApiKeyForProvider(providerID);
+  if (!accessToken) return false;
+
+  const credentials = getCachedCredentials(accessToken, providerID);
+  if (!credentials?.userID) return false;
+
+  const key = qoderAccountKey({ userID: credentials.userID, email: credentials.email });
+  if (!isAccountCatalogStale(mode, key)) return false;
 
   const region = getQoderRegionConfig(mode);
-  await updateQoderModelsCache(
-    credentials.access,
-    credentials.userID || "qoder-user",
+  return updateQoderModelsCache(
+    credentials.access || accessToken,
+    credentials.userID,
     credentials.name || region.userNameFallback,
     credentials.email || region.userEmailFallback,
     mode,
@@ -181,30 +250,48 @@ export default async function (pi: ExtensionAPI) {
     await initializeAccountProviders(pi, mode);
   }
 
-  // Refresh the models cache once per session at startup if it is missing or
-  // stale (>1h old), rather than on every message in the stream hot path.
-  // Login/refresh are the other rebuild triggers; this covers the case where
-  // the cache was deleted while the token is still valid.
+  // Panes are separate processes sharing one catalogue file. Watch its
+  // signature (mtime+size) so a pane picks up another pane's refresh without
+  // restarting; re-registration only happens when the file really changed.
+  const knownSignatures = new Map<QoderMode, string>();
+  const reRegisterIfCatalogChanged = (): void => {
+    for (const mode of QODER_MODES) {
+      const signature = qoderCatalogCacheSignature(mode);
+      if (knownSignatures.get(mode) === signature) continue;
+      knownSignatures.set(mode, signature);
+      reRegisterProvidersForMode(pi, mode);
+    }
+  };
+  // Seed the signatures from the catalogue these registrations were built
+  // from, so the first turn does not re-register needlessly.
+  for (const mode of QODER_MODES) {
+    knownSignatures.set(mode, qoderCatalogCacheSignature(mode));
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    // Adopt whatever another pane wrote while this one was idle, then refresh
+    // the accounts whose own slot is stale.
+    reRegisterIfCatalogChanged();
     for (const mode of QODER_MODES) {
       try {
-        if (!isCacheStale(mode)) continue;
-        const region = getQoderRegionConfig(mode);
-        for (let accountNumber = 1; accountNumber <= MAX_QODER_ACCOUNTS; accountNumber++) {
-          const providerID = accountProviderID(mode, accountNumber);
-          const accessToken = await ctx.modelRegistry.getApiKeyForProvider(providerID);
-          if (!accessToken) continue;
-          const creds = getCachedCredentials(accessToken, providerID);
-          const userID = creds?.userID || "qoder-user";
-          const name = creds?.name || region.userNameFallback;
-          const email = creds?.email || region.userEmailFallback;
-          await updateQoderModelsCache(accessToken, userID, name, email, mode);
-          reRegisterProvidersForMode(pi, mode);
-          break;
+        let changed = await refreshAccountCatalogs(mode);
+        if (listQoderAccounts(mode).length === 0) {
+          changed = (await refreshAccountFromRegistry(mode, ctx)) || changed;
         }
+        if (changed) reRegisterProvidersForMode(pi, mode);
       } catch {
         // Best-effort: fall back to the existing cache / static models.
       }
     }
+    reRegisterIfCatalogChanged();
+  });
+
+  pi.on("agent_end", () => {
+    // Reconcile after a turn rather than before one: re-registering replaces the
+    // provider that pi-multiprovider wraps in its account pool, and its own
+    // reconcile (which re-wraps the fresh provider) also runs at a turn
+    // boundary. Doing this before a request could bypass the pool for that
+    // request if handler ordering were reversed.
+    reRegisterIfCatalogChanged();
   });
 }

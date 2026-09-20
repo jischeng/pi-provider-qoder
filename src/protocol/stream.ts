@@ -13,7 +13,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { resolveQoderIdentity } from "../auth/oauth.js";
-import { buildThinkingLevelMap, getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
+import { buildThinkingLevelMap, checkAccountEntitlement, getCachedModelConfig, MAX_OUTPUT_TOKENS } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
@@ -308,6 +308,22 @@ export function streamQoder(
         throw new Error(`Unknown Qoder model id: ${model.id}`);
       }
       const qoderModel = modelConfig.key;
+
+      // Pre-flight entitlement: Qoder only rejects a model the account cannot
+      // serve after holding the SSE connection open for ~3 minutes (403 code
+      // 112), so a misrouted pooled request costs minutes. The per-account
+      // catalogue is already cached, so fail locally in milliseconds instead;
+      // accounts with an unknown or stale catalogue keep failing open.
+      const entitlement = checkAccountEntitlement(providerMode, userID, model.id);
+      if (entitlement.checked && !entitlement.served) {
+        // "upstream status 403" keeps the wording classifiable by hosts that
+        // route pooled accounts on HTTP status (multiprovider's default
+        // failure classification), so the request fails over instead of dying.
+        throw new Error(
+          `Qoder entitlement: account ${email} cannot serve model "${model.id}" ` +
+            "(upstream status 403 code 112 entitlement). Route it to an account whose plan includes it.",
+        );
+      }
 
       const isReasoning = !!modelConfig.is_reasoning;
 

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
-import { updateQoderModelsCache } from "../catalog.js";
+import { qoderAccountKey, updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
 import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
@@ -42,31 +42,109 @@ function getMultiAuthFilePath(): string {
   return join(getHomeDir(), ".pi", "agent", "multiprovider-auth.json");
 }
 
-function readMultiAuthCredentials(accessToken?: string, providerID = "qoder"): QoderCredentials | null {
+interface MultiAuthAccountEntry {
+  label?: string;
+  credential?: Record<string, unknown>;
+}
+
+/** Best-effort read of pi-multiprovider's account pool for one provider. */
+function readMultiAuthPool(providerID: string): MultiAuthAccountEntry[] {
   const multiAuthPath = getMultiAuthFilePath();
-  if (!existsSync(multiAuthPath)) return null;
+  if (!existsSync(multiAuthPath)) return [];
   try {
     const raw = readFileSync(multiAuthPath, "utf-8");
-    if (!raw.trim()) return null;
+    if (!raw.trim()) return [];
     const data = JSON.parse(raw) as {
-      providers?: Record<string, { accounts?: Array<{ credential?: Record<string, unknown> }> }>;
+      providers?: Record<string, { accounts?: MultiAuthAccountEntry[] }>;
     };
-    const pool = data?.providers?.[providerID];
-    if (!pool?.accounts || !Array.isArray(pool.accounts)) return null;
-
-    if (accessToken) {
-      const match = pool.accounts.find((acc) => acc.credential?.access === accessToken);
-      if (match?.credential?.userID) {
-        return match.credential as unknown as QoderCredentials;
-      }
-    } else {
-      const first = pool.accounts.find((acc) => acc.credential?.userID || acc.credential?.access);
-      if (first?.credential) {
-        return first.credential as unknown as QoderCredentials;
-      }
-    }
+    const accounts = data?.providers?.[providerID]?.accounts;
+    return Array.isArray(accounts) ? accounts : [];
   } catch {}
+  return [];
+}
+
+function readMultiAuthCredentials(accessToken?: string, providerID = "qoder"): QoderCredentials | null {
+  const accounts = readMultiAuthPool(providerID);
+  if (accounts.length === 0) return null;
+
+  if (accessToken) {
+    const match = accounts.find((acc) => acc.credential?.access === accessToken);
+    if (match?.credential?.userID) {
+      return match.credential as unknown as QoderCredentials;
+    }
+  } else {
+    const first = accounts.find((acc) => acc.credential?.userID || acc.credential?.access);
+    if (first?.credential) {
+      return first.credential as unknown as QoderCredentials;
+    }
+  }
   return null;
+}
+
+/** One catalogue-addressable Qoder account (pi auth.json entry or pool account). */
+export interface QoderAccountCredential {
+  /** Stable catalogue slot key (Qoder userID, email digest as fallback). */
+  key: string;
+  /** Logical pi provider id this credential belongs to (qoder, qoder-2, ...). */
+  providerID: string;
+  access: string;
+  userID: string;
+  email: string;
+  name: string;
+  expires?: number;
+  source: "auth" | "multiprovider";
+}
+
+/**
+ * Enumerate every Qoder account we can see for a region.
+ *
+ * A single provider id (e.g. `qoder`) can be backed by several accounts: pi's
+ * own auth.json slots (`qoder`, `qoder-2`, ...) plus the accounts pooled by
+ * pi-multiprovider. `/model/list` answers per account, so the catalogue refresh
+ * must walk all of them — refreshing only auth.json's account is what pinned
+ * the visible catalogue to one account's entitlement.
+ */
+export function listQoderAccounts(mode: QoderMode): QoderAccountCredential[] {
+  const prefix = getQoderRegionConfig(mode).providerID;
+  const found = new Map<string, QoderAccountCredential>();
+
+  const add = (
+    credential: Record<string, unknown> | undefined,
+    providerID: string,
+    source: QoderAccountCredential["source"],
+  ): void => {
+    const access = typeof credential?.access === "string" ? credential.access : "";
+    if (!access) return;
+    const userID = typeof credential?.userID === "string" ? credential.userID : "";
+    const email = typeof credential?.email === "string" ? credential.email : "";
+    const name = typeof credential?.name === "string" ? credential.name : "";
+    const key = qoderAccountKey({ userID, email });
+    const existing = found.get(key);
+    // pi's own auth.json entry wins over the same account inside a pool.
+    if (existing && !(existing.source === "multiprovider" && source === "auth")) return;
+    found.set(key, {
+      key,
+      providerID,
+      access,
+      userID,
+      email,
+      name,
+      ...(typeof credential?.expires === "number" ? { expires: credential.expires } : {}),
+      source,
+    });
+  };
+
+  const auth = readAuthFileCached();
+  for (const [providerID, credential] of Object.entries(auth ?? {})) {
+    if (providerID !== prefix && !providerID.startsWith(`${prefix}-`)) continue;
+    add(credential as Record<string, unknown>, providerID, "auth");
+  }
+
+  for (const entry of readMultiAuthPool(prefix)) {
+    add(entry.credential, prefix, "multiprovider");
+  }
+
+  return [...found.values()];
 }
 
 /** Memoized parse of auth.json; invalidated on save. null = not loaded. */

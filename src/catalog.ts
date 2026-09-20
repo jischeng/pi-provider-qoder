@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
@@ -95,40 +95,118 @@ function getQoderCachePath(mode: QoderMode): string {
   return join(getHomeDir(), ".pi", "agent", getQoderRegionConfig(mode).modelCacheFile);
 }
 
+/**
+ * On-disk catalogue format.
+ *
+ * v1 kept a single catalogue per region. That is wrong for Qoder: `/model/list`
+ * is account-scoped, so a quota-exhausted (or free-plan) account answers with
+ * its `is_free` models only. One shared slot let that degraded answer erase a
+ * funded account's full catalogue, which collapsed the picker to Qwen-only.
+ *
+ * v2 keeps one slot per account and mirrors the merged catalogue at the top
+ * level, so both the union view and v1-era readers stay valid.
+ */
+const CACHE_VERSION = 2;
+
+/** Slot key for a pre-v2 snapshot whose owning account is unknown. */
+export const UNKNOWN_ACCOUNT_KEY = "__unknown__";
+
+export interface QoderAccountCatalog {
+  updatedAt: number;
+  identity: { userID?: string; email?: string; name?: string };
+  /**
+   * True when the account looks quota-degraded (free-only catalogue that is
+   * smaller than the last known-good one). Recovery from the account itself
+   * clears the flag; a stored list kept by the downgrade guard stays flagged.
+   */
+  degraded?: boolean;
+  models: QoderModelDef[];
+  configs?: Record<string, QoderModelEntry>;
+  /**
+   * Model ids from the most recent successful `/model/list` response for this
+   * account, kept separately from `models`.
+   *
+   * `models` may have been preserved from an earlier, richer response by the
+   * quota-downgrade guard, so it must never be used to decide whether this
+   * account is allowed to call a model — `servedModelIds` is the raw answer.
+   */
+  servedModelIds?: string[];
+}
+
 interface ParsedModelCache {
+  version?: number;
+  // v1 top-level view: mirror of the merged catalogue for older readers.
   updatedAt?: number;
   models?: QoderModelDef[];
   configs?: Record<string, QoderModelEntry>;
+  /** v2 account slots — source of truth when present. */
+  accounts?: Record<string, QoderAccountCatalog>;
+}
+
+interface CatalogSlot {
+  key: string;
+  data: QoderAccountCatalog;
 }
 
 /** In-memory cache keyed by absolute cache path (HOME-safe across tests). */
-const modelCacheMem = new Map<string, ParsedModelCache>();
+const modelCacheMem = new Map<string, { sig: string; data: ParsedModelCache }>();
 
 /** Clear process-memory model caches (also used by tests that mutate cache files). */
 export function clearQoderModelsMemCache(): void {
   modelCacheMem.clear();
 }
 
+/**
+ * Identify an account slot. Preferred key is the stable Qoder userID, with an
+ * email digest as fallback, so a rotated access token never creates a new slot.
+ */
+export function qoderAccountKey(identity: { userID?: string; email?: string }): string {
+  const userID = identity.userID?.trim();
+  if (userID) return userID;
+  const email = identity.email?.trim().toLowerCase();
+  if (email) return `email:${createHash("sha1").update(email).digest("hex").slice(0, 12)}`;
+  return UNKNOWN_ACCOUNT_KEY;
+}
+
+/** `mtime:size` signature so a write from another pane/process invalidates the memo. */
+function cacheSignature(cachePath: string): string {
+  try {
+    const stat = statSync(cachePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return "missing";
+  }
+}
+
+/** Signature of a region's catalogue file; used to detect cross-process updates. */
+export function qoderCatalogCacheSignature(mode: QoderMode): string {
+  return cacheSignature(getQoderCachePath(mode));
+}
+
 function readParsedModelCache(mode: QoderMode): ParsedModelCache | null {
   const cachePath = getQoderCachePath(mode);
+  const sig = cacheSignature(cachePath);
   const mem = modelCacheMem.get(cachePath);
-  if (mem) {
-    return mem;
+  if (mem && mem.sig === sig) {
+    return mem.data;
   }
-  if (!existsSync(cachePath)) {
-    return null;
+  if (sig === "missing") {
+    // File removed externally: keep serving the memoized catalogue (hot path),
+    // and fall back to static models only when nothing was ever loaded.
+    return mem?.data ?? null;
   }
   try {
     const raw = readFileSync(cachePath, "utf8");
-    if (!raw.trim()) return null;
+    if (!raw.trim()) return mem?.data ?? null;
     const data = JSON.parse(raw) as ParsedModelCache;
-    if (data && Array.isArray(data.models) && data.models.length > 0) {
-      modelCacheMem.set(cachePath, data);
-      return data;
-    }
-    return null;
+    if (!data || typeof data !== "object") return mem?.data ?? null;
+    const hasAccounts = !!data.accounts && typeof data.accounts === "object" && Object.keys(data.accounts).length > 0;
+    const hasLegacy = Array.isArray(data.models) && data.models.length > 0;
+    if (!hasAccounts && !hasLegacy) return null;
+    modelCacheMem.set(cachePath, { sig, data });
+    return data;
   } catch {
-    return null;
+    return mem?.data ?? null;
   }
 }
 
@@ -142,7 +220,7 @@ function writeParsedModelCache(mode: QoderMode, data: ParsedModelCache): void {
   } finally {
     rmSync(temporaryPath, { force: true });
   }
-  modelCacheMem.set(cachePath, data);
+  modelCacheMem.set(cachePath, { sig: cacheSignature(cachePath), data });
 }
 
 /**
@@ -694,53 +772,161 @@ export function buildThinkingLevelMap(entry: QoderModelEntry): ThinkingLevelMap 
   return undefined;
 }
 
+/** Look up a catalogue entry by public model id, tolerating v1 raw-key shapes. */
+function findConfigEntry(
+  configs: Record<string, QoderModelEntry> | undefined,
+  modelId: string,
+): QoderModelEntry | undefined {
+  if (!configs) return undefined;
+  const direct = configs[modelId];
+  if (direct) return direct;
+  return Object.values(configs).find(
+    (entry) =>
+      entry && typeof entry === "object" && toQoderModelId((entry as QoderModelEntry).display_name) === modelId,
+  ) as QoderModelEntry | undefined;
+}
+
+/** Map a stored model record onto the public picker shape. */
+function normalizeCachedModel(
+  model: QoderModelDef,
+  configs: Record<string, QoderModelEntry> | undefined,
+  mode: QoderMode,
+): QoderModelDef {
+  const config = findConfigEntry(configs, model.id);
+  const display = config?.display_name;
+  const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((seed) => seed.upstreamKey === model.id);
+  const thinkingLevelMap = model.thinkingLevelMap ?? (config ? buildThinkingLevelMap(config) : undefined);
+  const baseModel = display
+    ? { ...model, id: toQoderModelId(display), name: display, thinkingLevelMap }
+    : staticModel
+      ? { ...model, id: staticModel.id, name: staticModel.name, thinkingLevelMap }
+      : model.name
+        ? { ...model, id: toQoderModelId(model.name), thinkingLevelMap }
+        : { ...model, thinkingLevelMap };
+  const priceFactor = model.priceFactor ?? getPriceFactor(config?.price_factor);
+  return withPriceFactor(baseModel, priceFactor);
+}
+
+/** Higher is richer; used to pick between two records sharing a public id. */
+function modelRichness(model: QoderModelDef): number {
+  return (model.reasoning ? 4 : 0) + (model.thinkingLevelMap ? 2 : 0) + (model.input.includes("image") ? 1 : 0);
+}
+
+function mergeCatalogModels(a: QoderModelDef, b: QoderModelDef): QoderModelDef {
+  const winner = modelRichness(b) > modelRichness(a) ? b : a;
+  return withPriceFactor(winner, winner.priceFactor ?? a.priceFactor ?? b.priceFactor);
+}
+
+/**
+ * Read every stored slot. Degraded slots sort last so a healthy account's
+ * definition, ordering and price factor win when they advertise the same model.
+ */
+function collectCatalogSlots(data: ParsedModelCache): CatalogSlot[] {
+  const accounts = data.accounts;
+  if (accounts && typeof accounts === "object") {
+    const slots = Object.entries(accounts)
+      .map(([key, value]) => ({ key, data: value as QoderAccountCatalog }))
+      .filter((slot) => slot.data && Array.isArray(slot.data.models) && slot.data.models.length > 0);
+    if (slots.length > 0) return sortCatalogSlots(slots);
+  }
+  // Pre-v2 snapshot: attribute it to an unknown account so it still contributes.
+  if (Array.isArray(data.models) && data.models.length > 0) {
+    return [
+      {
+        key: UNKNOWN_ACCOUNT_KEY,
+        data: { updatedAt: data.updatedAt ?? 0, identity: {}, models: data.models, configs: data.configs },
+      },
+    ];
+  }
+  return [];
+}
+
+function sortCatalogSlots(slots: CatalogSlot[]): CatalogSlot[] {
+  return [...slots].sort((a, b) => {
+    const degraded = Number(!!a.data.degraded) - Number(!!b.data.degraded);
+    if (degraded !== 0) return degraded;
+    return (b.data.updatedAt ?? 0) - (a.data.updatedAt ?? 0);
+  });
+}
+
+/**
+ * Union the account slots into one picker catalogue.
+ *
+ * The union is the whole point of v2: a quota-exhausted account contributes
+ * only its free models, and they can no longer shrink another account's list.
+ */
+function mergeCatalogSlots(
+  mode: QoderMode,
+  slots: CatalogSlot[],
+): { models: QoderModelDef[]; configs: Record<string, QoderModelEntry> } {
+  const byId = new Map<string, QoderModelDef>();
+  const configs: Record<string, QoderModelEntry> = {};
+
+  for (const slot of slots) {
+    for (const raw of slot.data.models) {
+      const model = normalizeCachedModel(raw, slot.data.configs, mode);
+      const existing = byId.get(model.id);
+      if (existing) {
+        byId.set(model.id, mergeCatalogModels(existing, model));
+        continue;
+      }
+      byId.set(model.id, model);
+      const entry = findConfigEntry(slot.data.configs, raw.id) ?? findConfigEntry(slot.data.configs, model.id);
+      if (entry) configs[model.id] = entry;
+    }
+  }
+
+  // Older releases injected `auto` without a corresponding service config.
+  // Keep an explicitly enabled service model, but drop the legacy fallback.
+  const hasConfigsMap = slots.some((slot) => slot.data.configs && typeof slot.data.configs === "object");
+  // Detect a real service `auto` entry (its upstream key), not the legacy
+  // injected placeholder: configs are keyed by display name, so a live `Auto`
+  // model appears as `Auto`, never as `auto`.
+  const hasAuto = slots.some((slot) =>
+    Object.values(slot.data.configs ?? {}).some((entry) => (entry as QoderModelEntry)?.key === "auto"),
+  );
+  const merged = [...byId.values()];
+  const models = hasConfigsMap && !hasAuto ? merged.filter((model) => model.id.toLowerCase() !== "auto") : merged;
+  return { models, configs };
+}
+
+function staticModelsFor(mode: QoderMode): QoderModelDef[] {
+  return mode === "cn" ? staticCnModels : staticModels;
+}
+
+function buildCacheDocument(mode: QoderMode, accounts: Record<string, QoderAccountCatalog>): ParsedModelCache {
+  const slots = sortCatalogSlots(Object.entries(accounts).map(([key, data]) => ({ key, data })));
+  const { models, configs } = mergeCatalogSlots(mode, slots);
+  const updatedAt = Object.values(accounts).reduce((max, slot) => Math.max(max, slot.updatedAt ?? 0), 0);
+  return { version: CACHE_VERSION, updatedAt, models, configs, accounts };
+}
+
 export function getCachedModels(mode: QoderMode): QoderModelDef[] {
   const data = readParsedModelCache(mode);
-  if (data && Array.isArray(data.models)) {
-    const models = data.models.map((model: QoderModelDef) => {
-      const config = (data.configs?.[model.id] ??
-        Object.values(data.configs || {}).find(
-          (entry) =>
-            entry && typeof entry === "object" && toQoderModelId((entry as QoderModelEntry).display_name) === model.id,
-        )) as QoderModelEntry | undefined;
-      const display = config?.display_name;
-      const staticModel = (mode === "cn" ? staticCnModels : staticModels).find((seed) => seed.upstreamKey === model.id);
-      const thinkingLevelMap = model.thinkingLevelMap ?? (config ? buildThinkingLevelMap(config) : undefined);
-      const baseModel = display
-        ? { ...model, id: toQoderModelId(display), name: display, thinkingLevelMap }
-        : staticModel
-          ? { ...model, id: staticModel.id, name: staticModel.name, thinkingLevelMap }
-          : model.name
-            ? { ...model, id: toQoderModelId(model.name), thinkingLevelMap }
-            : { ...model, thinkingLevelMap };
-      const priceFactor = model.priceFactor ?? getPriceFactor(config?.price_factor);
-      return withPriceFactor(baseModel, priceFactor);
-    });
-    // Older releases injected `auto` without a corresponding service config.
-    // Keep an explicitly enabled service model, but drop the legacy fallback.
-    if (data.configs && typeof data.configs === "object" && !data.configs.auto) {
-      return models.filter((model: QoderModelDef) => model.id.toLowerCase() !== "auto");
-    }
-    return models;
-  }
-  return mode === "cn" ? staticCnModels : staticModels;
+  const slots = data ? collectCatalogSlots(data) : [];
+  if (slots.length === 0) return staticModelsFor(mode);
+  const { models } = mergeCatalogSlots(mode, slots);
+  return models.length > 0 ? models : staticModelsFor(mode);
 }
 
 export function getCachedModelConfig(modelId: string, mode: QoderMode): QoderModelEntry | null {
   const data = readParsedModelCache(mode);
   if (data) {
-    const direct = data.configs?.[modelId] as QoderModelEntry | undefined;
-    if (direct && toQoderModelId(direct.display_name) === modelId) {
-      return withMaxContextAsDefault(direct);
-    }
+    // Healthy accounts first, so a degraded slot cannot override their entry.
+    for (const slot of collectCatalogSlots(data)) {
+      const direct = slot.data.configs?.[modelId] as QoderModelEntry | undefined;
+      if (direct && toQoderModelId(direct.display_name) === modelId) {
+        return withMaxContextAsDefault(direct);
+      }
 
-    // Read old cache shapes without preserving their raw-key aliases.
-    const legacyEntry = Object.values(data.configs || {}).find(
-      (entry) =>
-        entry && typeof entry === "object" && toQoderModelId((entry as QoderModelEntry).display_name) === modelId,
-    ) as QoderModelEntry | undefined;
-    if (legacyEntry) {
-      return withMaxContextAsDefault(legacyEntry);
+      // Read old cache shapes without preserving their raw-key aliases.
+      const legacyEntry = Object.values(slot.data.configs || {}).find(
+        (entry) =>
+          entry && typeof entry === "object" && toQoderModelId((entry as QoderModelEntry).display_name) === modelId,
+      ) as QoderModelEntry | undefined;
+      if (legacyEntry) {
+        return withMaxContextAsDefault(legacyEntry);
+      }
     }
   }
 
@@ -813,9 +999,127 @@ function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
 
 export function isCacheStale(mode: QoderMode): boolean {
   const data = readParsedModelCache(mode);
-  if (!data || typeof data.updatedAt !== "number") return true;
+  if (!data) return true;
+  const slots = collectCatalogSlots(data);
+  if (slots.length === 0) return true;
+  return slots.some((slot) => isSlotStale(slot.data));
+}
+
+function isSlotStale(slot: QoderAccountCatalog | undefined): boolean {
+  if (!slot || typeof slot.updatedAt !== "number") return true;
   // Stale if older than 1 hour
-  return Date.now() - data.updatedAt > 3600_000;
+  return Date.now() - slot.updatedAt > 3600_000;
+}
+
+/**
+ * Per-account staleness. One degraded account must not force every other
+ * account to re-fetch on every session start.
+ */
+export function isAccountCatalogStale(mode: QoderMode, accountKey: string): boolean {
+  const data = readParsedModelCache(mode);
+  return isSlotStale(data?.accounts?.[accountKey]);
+}
+
+/** True when any catalogue (v1 or v2) is already on disk. */
+export function hasCachedCatalog(mode: QoderMode): boolean {
+  const data = readParsedModelCache(mode);
+  return !!data && collectCatalogSlots(data).length > 0;
+}
+
+/** Account keys currently stored for a region (used for diagnostics/tests). */
+export function getCachedCatalogAccounts(mode: QoderMode): string[] {
+  const data = readParsedModelCache(mode);
+  if (!data?.accounts || typeof data.accounts !== "object") return [];
+  return Object.keys(data.accounts);
+}
+
+/**
+ * A free-only answer from an account that previously returned more models is
+ * Qoder's quota-exhaustion signal (`isQuotaExceeded`), not a real catalogue
+ * change. Detecting it lets the slot keep its last known-good list.
+ */
+function isFreeOnlyCatalog(configs: Record<string, QoderModelEntry>): boolean {
+  const entries = Object.values(configs);
+  if (entries.length === 0) return false;
+  return entries.every((entry) => (entry as { is_free?: boolean })?.is_free === true);
+}
+
+/** How long an account's own catalogue is trusted for entitlement decisions. */
+const ENTITLEMENT_TRUST_WINDOW_MS = 3600_000;
+
+/** Account-scoped view of what a credential can serve, used before dispatch. */
+export interface QoderAccountServedModels {
+  key: string;
+  modelIds: string[];
+  updatedAt: number;
+  /** True when the account's own catalogue is fresh enough to trust. */
+  fresh: boolean;
+}
+
+/**
+ * Model ids the account's credential can serve, from its own cached catalogue.
+ * Returns null when we know nothing about the account (callers fail open).
+ */
+export function getAccountServedModels(mode: QoderMode, userID: string): QoderAccountServedModels | null {
+  const trimmed = userID?.trim();
+  if (!trimmed) return null;
+  const data = readParsedModelCache(mode);
+  const key = qoderAccountKey({ userID: trimmed });
+  const slot = data?.accounts?.[key];
+  if (!slot) return null;
+  const updatedAt = typeof slot.updatedAt === "number" ? slot.updatedAt : 0;
+  return {
+    key,
+    modelIds: [...(slot.servedModelIds ?? slot.models.map((model) => model.id))],
+    updatedAt,
+    fresh: updatedAt > 0 && Date.now() - updatedAt <= ENTITLEMENT_TRUST_WINDOW_MS,
+  };
+}
+
+export type QoderEntitlementVerdict =
+  | { checked: false }
+  | { checked: true; served: boolean; modelIds: readonly string[] };
+
+/**
+ * Decide whether an account may call a model *before* spending a request on it.
+ *
+ * Qoder answers a model the account is not entitled to with `403 code 112`
+ * only after holding the SSE connection open for ~3 minutes, so one misrouted
+ * request costs minutes. The per-account catalogue we already cache matches
+ * that entitlement exactly (verified live for plan-restricted models), so use
+ * it to fail in milliseconds instead.
+ *
+ * The veto is deliberately narrow:
+ *   - unknown, blank or stale account catalogue -> `checked: false` (fail open);
+ *   - the model is listed by the account          -> served;
+ *   - nobody in the region lists the model        -> `checked: false`, because
+ *     that is more likely a brand-new catalogue entry than a restriction.
+ */
+export function checkAccountEntitlement(mode: QoderMode, userID: string, modelId: string): QoderEntitlementVerdict {
+  const served = getAccountServedModels(mode, userID);
+  if (!served?.fresh) return { checked: false };
+  const wanted = toQoderModelId(modelId).toLowerCase();
+  const matches = (id: string): boolean => toQoderModelId(id).toLowerCase() === wanted;
+  if (served.modelIds.some(matches)) return { checked: true, served: true, modelIds: served.modelIds };
+  if (!getRegionServedModelIds(mode, served.key).some(matches)) return { checked: false };
+  return { checked: true, served: false, modelIds: served.modelIds };
+}
+
+/**
+ * Model ids served by at least one *fresh* account catalogue in this region.
+ * Used to tell a plan restriction apart from a brand-new model.
+ */
+export function getRegionServedModelIds(mode: QoderMode, excludeKey?: string): string[] {
+  const data = readParsedModelCache(mode);
+  if (!data?.accounts) return [];
+  const seen = new Set<string>();
+  for (const [key, slot] of Object.entries(data.accounts)) {
+    if (excludeKey !== undefined && key === excludeKey) continue;
+    const updatedAt = typeof slot.updatedAt === "number" ? slot.updatedAt : 0;
+    if (updatedAt === 0 || Date.now() - updatedAt > ENTITLEMENT_TRUST_WINDOW_MS) continue;
+    for (const id of slot.servedModelIds ?? slot.models.map((model) => model.id)) seen.add(id);
+  }
+  return [...seen];
 }
 
 export async function updateQoderModelsCache(
@@ -824,7 +1128,7 @@ export async function updateQoderModelsCache(
   name: string,
   email: string,
   mode: QoderMode,
-): Promise<void> {
+): Promise<boolean> {
   const modelListURL = getQoderModelListURL(mode);
   try {
     const headers = buildAuthHeaders(null, modelListURL, {
@@ -844,12 +1148,12 @@ export async function updateQoderModelsCache(
     });
 
     if (!response.ok) {
-      return;
+      return false;
     }
 
     const resData = (await response.json()) as { chat?: QoderModelEntry[] };
     const chatModels = resData.chat || [];
-    if (chatModels.length === 0) return;
+    if (chatModels.length === 0) return false;
 
     const newModels: QoderModelDef[] = [];
     const configs: Record<string, QoderModelEntry> = {};
@@ -894,14 +1198,47 @@ export async function updateQoderModelsCache(
       });
     }
 
-    if (newModels.length === 0) return;
+    if (newModels.length === 0) return false;
 
-    const cacheData = {
+    const key = qoderAccountKey({ userID, email });
+    const previous = readParsedModelCache(mode);
+    const previousAccounts = previous?.accounts ?? {};
+    const previousSlot = previousAccounts[key];
+    // A pre-v2 snapshot is un-attributed: let the first refreshed account
+    // inherit it so the upgrade cannot lose models that are still valid.
+    const inheritedSlot =
+      previousSlot ??
+      (previous ? collectCatalogSlots(previous).find((slot) => slot.key === UNKNOWN_ACCOUNT_KEY)?.data : undefined);
+
+    const freeOnly = isFreeOnlyCatalog(configs);
+    const shrank = (inheritedSlot?.models.length ?? 0) > newModels.length;
+    const quotaDegraded = freeOnly && shrank;
+    const degraded = freeOnly && (quotaDegraded || previousSlot?.degraded === true);
+
+    const accounts: Record<string, QoderAccountCatalog> = { ...previousAccounts };
+    accounts[key] = {
       updatedAt: Date.now(),
-      models: newModels,
-      configs,
+      identity: { userID, email, name },
+      ...(degraded ? { degraded: true } : {}),
+      // Keep the last known-good list for a quota-exhausted account instead of
+      // erasing models its plan still lists once the quota resets.
+      models: quotaDegraded && inheritedSlot ? inheritedSlot.models : newModels,
+      configs: quotaDegraded && inheritedSlot?.configs ? { ...inheritedSlot.configs, ...configs } : configs,
+      // Routing signal: what this account's credential can serve right now.
+      servedModelIds: newModels.map((model) => model.id),
     };
+    delete accounts[UNKNOWN_ACCOUNT_KEY];
 
-    writeParsedModelCache(mode, cacheData);
-  } catch {}
+    writeParsedModelCache(mode, buildCacheDocument(mode, accounts));
+
+    if (quotaDegraded) {
+      console.error(
+        `[pi-provider-qoder] ${mode} account ${email || userID} returned a free-only catalog ` +
+          `(${newModels.length} of ${inheritedSlot?.models.length ?? 0} models); keeping the last known-good list.`,
+      );
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }

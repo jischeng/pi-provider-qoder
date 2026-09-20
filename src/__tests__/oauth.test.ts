@@ -46,6 +46,8 @@ vi.mock("../auth/pat.js", () => ({
 
 vi.mock("../catalog.js", () => ({
   updateQoderModelsCache: vi.fn().mockResolvedValue(undefined),
+  qoderAccountKey: (identity: { userID?: string; email?: string }) =>
+    identity.userID || identity.email || "__unknown__",
   getCachedModels: vi.fn().mockReturnValue([]),
   isCacheStale: vi.fn().mockReturnValue(true),
   staticModels: [],

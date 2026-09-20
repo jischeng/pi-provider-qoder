@@ -2,7 +2,18 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearQoderModelsMemCache, getCachedModelConfig, getCachedModels, updateQoderModelsCache } from "../catalog.js";
+import {
+  checkAccountEntitlement,
+  clearQoderModelsMemCache,
+  getAccountServedModels,
+  getCachedCatalogAccounts,
+  getCachedModelConfig,
+  getCachedModels,
+  getRegionServedModelIds,
+  hasCachedCatalog,
+  isAccountCatalogStale,
+  updateQoderModelsCache,
+} from "../catalog.js";
 import { loadLiveFixture, responseFromFixture } from "./live-fixture.js";
 
 function testHome(): string {
@@ -243,5 +254,216 @@ describe("Qoder model cache", () => {
     expect(existsSync(CACHE_PATHS.global)).toBe(false);
     expect(getCachedModelConfig("Lite", "global")?.key).toBe("lite");
     expect(getCachedModels("global").map((m) => m.id)).toEqual(["Lite"]);
+  });
+});
+
+/**
+ * Qoder answers /model/list per account: a quota-exhausted account only ships
+ * its `is_free` models. One shared cache slot let that degraded answer erase a
+ * funded account's catalogue, which showed up as "only Qwen models".
+ */
+describe("per-account catalog slots", () => {
+  const HEALTHY_CHAT = [
+    { key: "efficient", enable: true, display_name: "Efficient", is_free: true },
+    { key: "qmodel_38max", enable: true, display_name: "Qwen3.8-Max", is_free: true },
+    { key: "gmodel", enable: true, display_name: "GLM-5.3", is_reasoning: true },
+    { key: "kmodel", enable: true, display_name: "Kimi-K2.7-Code" },
+  ];
+  const FREE_ONLY_CHAT = [
+    { key: "efficient", enable: true, display_name: "Efficient", is_free: true },
+    { key: "qmodel_38max", enable: true, display_name: "Qwen3.8-Max", is_free: true },
+    { key: "qfmodel", enable: true, display_name: "Qwen3.8-Flash", is_free: true },
+  ];
+
+  function jsonResponse(chat: unknown[]) {
+    return { ok: true, json: () => Promise.resolve({ chat }) };
+  }
+
+  function modelIdSet(): string[] {
+    return getCachedModels("global")
+      .map((model) => model.id)
+      .sort();
+  }
+
+  it("unions a funded account's catalogue with a free-only account's catalogue", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)).mockResolvedValueOnce(jsonResponse(FREE_ONLY_CHAT)),
+    );
+
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    await updateQoderModelsCache("token-b", "user-b", "B", "b@example.com", "global");
+
+    expect(getCachedCatalogAccounts("global").sort()).toEqual(["user-a", "user-b"]);
+    expect(modelIdSet()).toEqual(["Efficient", "GLM-5.3", "Kimi-K2.7-Code", "Qwen3.8-Flash", "Qwen3.8-Max"].sort());
+    // A model only the funded account advertises still resolves for requests.
+    expect(getCachedModelConfig("GLM-5.3", "global")?.key).toBe("gmodel");
+    expect(getCachedModelConfig("Qwen3.8-Flash", "global")?.key).toBe("qfmodel");
+  });
+
+  it("does not let a later degraded refresh shrink an earlier healthy catalogue", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)).mockResolvedValueOnce(jsonResponse(FREE_ONLY_CHAT)),
+    );
+
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    await updateQoderModelsCache("token-b", "user-b", "B", "b@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.accounts["user-a"].models.length).toBe(4);
+    expect(cache.accounts["user-a"].degraded).toBeUndefined();
+  });
+
+  it("keeps the last known-good list for a quota-degraded account and flags it", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)).mockResolvedValueOnce(jsonResponse(FREE_ONLY_CHAT)),
+    );
+
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    clearQoderModelsMemCache();
+    // Same account, now quota-exhausted: Qoder answers with the free subset.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3600_001);
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(cache.accounts["user-a"].degraded).toBe(true);
+    expect(cache.accounts["user-a"].models.map((model: { id: string }) => model.id)).toEqual([
+      "Efficient",
+      "Qwen3.8-Max",
+      "GLM-5.3",
+      "Kimi-K2.7-Code",
+    ]);
+    expect(modelIdSet()).toEqual(["Efficient", "GLM-5.3", "Kimi-K2.7-Code", "Qwen3.8-Max"].sort());
+  });
+
+  it("inherits a pre-v2 snapshot, then replaces it once a real account is stored", async () => {
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        updatedAt: Date.now(),
+        models: [{ id: "Efficient" }, { id: "Qwen3.8-Max" }, { id: "GLM-5.3" }, { id: "Kimi-K2.7-Code" }],
+        configs: {
+          Efficient: { key: "efficient", enable: true, display_name: "Efficient", is_free: true },
+          "Qwen3.8-Max": { key: "qmodel_38max", enable: true, display_name: "Qwen3.8-Max", is_free: true },
+          "GLM-5.3": { key: "gmodel", enable: true, display_name: "GLM-5.3", is_reasoning: true },
+          "Kimi-K2.7-Code": { key: "kmodel", enable: true, display_name: "Kimi-K2.7-Code" },
+        },
+      }),
+      "utf8",
+    );
+    clearQoderModelsMemCache();
+
+    expect(getCachedCatalogAccounts("global")).toEqual([]);
+    expect(modelIdSet()).toEqual(["Efficient", "GLM-5.3", "Kimi-K2.7-Code", "Qwen3.8-Max"].sort());
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jsonResponse(FREE_ONLY_CHAT)));
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    expect(Object.keys(cache.accounts)).toEqual(["user-a"]);
+    // The free-only answer was smaller than the inherited snapshot, so the
+    // snapshot is kept (flagged) instead of being replaced by 3 free models.
+    expect(cache.accounts["user-a"].degraded).toBe(true);
+    expect(cache.accounts["user-a"].models.map((model: { id: string }) => model.id)).toEqual([
+      "Efficient",
+      "Qwen3.8-Max",
+      "GLM-5.3",
+      "Kimi-K2.7-Code",
+    ]);
+  });
+
+  it("tracks staleness per account", async () => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)));
+
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+
+    expect(isAccountCatalogStale("global", "user-a")).toBe(false);
+    expect(isAccountCatalogStale("global", "user-b")).toBe(true);
+
+    vi.spyOn(Date, "now").mockReturnValue(now + 3600_001);
+    expect(isAccountCatalogStale("global", "user-a")).toBe(true);
+  });
+
+  it("re-reads the file when another process rewrites it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)));
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    expect(modelIdSet()).toEqual(["Efficient", "GLM-5.3", "Kimi-K2.7-Code", "Qwen3.8-Max"].sort());
+
+    // Simulate a sibling pane writing a different catalogue (no mem-cache clear).
+    writeFileSync(
+      CACHE_PATHS.global,
+      JSON.stringify({
+        version: 2,
+        updatedAt: Date.now(),
+        models: [{ id: "Sonus" }],
+        configs: { Sonus: { key: "sonus", enable: true, display_name: "Sonus" } },
+        accounts: {
+          "user-z": {
+            updatedAt: Date.now(),
+            identity: { userID: "user-z" },
+            models: [{ id: "Sonus" }],
+            configs: { Sonus: { key: "sonus", enable: true, display_name: "Sonus" } },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    expect(hasCachedCatalog("global")).toBe(true);
+    expect(getCachedModels("global").map((model) => model.id)).toEqual(["Sonus"]);
+  });
+
+  it("records the raw served models separately from a downgrade-guarded list", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT)).mockResolvedValueOnce(jsonResponse(FREE_ONLY_CHAT)),
+    );
+
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+
+    const cache = JSON.parse(readFileSync(CACHE_PATHS.global, "utf8"));
+    const slot = cache.accounts["user-a"];
+    // The display list kept the richer (guarded) answer...
+    expect(slot.models.map((model: { id: string }) => model.id)).toContain("GLM-5.3");
+    // ...but routing must use the raw answer of the last successful fetch.
+    expect(slot.servedModelIds).toEqual(["Efficient", "Qwen3.8-Max", "Qwen3.8-Flash"]);
+  });
+
+  it("answers entitlement from the account's own fresh catalogue only", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(jsonResponse(HEALTHY_CHAT))
+        .mockResolvedValueOnce(jsonResponse([{ key: "kmodel_latest", enable: true, display_name: "Kimi-K3" }])),
+    );
+    await updateQoderModelsCache("token-a", "user-a", "A", "a@example.com", "global");
+    await updateQoderModelsCache("token-b", "user-b", "B", "b@example.com", "global");
+
+    expect(getAccountServedModels("global", "user-a")?.modelIds).toContain("GLM-5.3");
+    expect(checkAccountEntitlement("global", "user-a", "GLM-5.3")).toMatchObject({
+      checked: true,
+      served: true,
+    });
+    // Listed by another account, missing from this one: the misroute we veto.
+    expect(getRegionServedModelIds("global", "user-a")).toEqual(["Kimi-K3"]);
+    expect(checkAccountEntitlement("global", "user-a", "Kimi-K3")).toMatchObject({
+      checked: true,
+      served: false,
+    });
+    // Nobody lists it: more likely a brand-new model than a restriction.
+    expect(checkAccountEntitlement("global", "user-a", "Kimi-K9")).toEqual({ checked: false });
+    // Unknown accounts and blank identities stay fail-open.
+    expect(checkAccountEntitlement("global", "user-unknown", "Kimi-K3")).toEqual({ checked: false });
+    expect(checkAccountEntitlement("global", "", "Kimi-K3")).toEqual({ checked: false });
+
+    // A stale catalogue is not trusted for entitlement either.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 3600_001);
+    expect(checkAccountEntitlement("global", "user-a", "Kimi-K3")).toEqual({ checked: false });
   });
 });

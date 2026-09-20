@@ -1,3 +1,5 @@
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type {
   Api,
   AssistantMessage,
@@ -8,6 +10,7 @@ import type {
   ToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { clearQoderModelsMemCache } from "../catalog.js";
 import { qoderDecodeBody } from "../protocol/encoding.js";
 import { streamQoder } from "../protocol/stream.js";
 import { loadLiveFixture } from "./live-fixture.js";
@@ -118,6 +121,55 @@ function makeModel(provider = "qoder", id = "Lite"): Model<Api> {
   return { id, api: "qoder-api" as Api, provider } as Model<Api>;
 }
 
+/**
+ * Write an account-scoped catalogue for the mocked identity ("test-user") so the
+ * entitlement pre-flight has something to check. `servedModelIds` is the raw
+ * answer of the account's last `/model/list`.
+ */
+function accountCatalogPath(): string {
+  return join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent", "qoder-models-cache.json");
+}
+
+/**
+ * Write an account-scoped catalogue for the mocked identity ("test-user") so the
+ * entitlement pre-flight has something to check. `servedModelIds` is the raw
+ * answer of the account's last `/model/list`.
+ */
+function writeAccountCatalog(servedModelIds: string[], modelIds: string[] = servedModelIds): void {
+  const configs = Object.fromEntries(
+    modelIds.map((id) => [id, { key: id.toLowerCase(), enable: true, display_name: id }]),
+  );
+  const slot = (ids: string[]) => ({
+    updatedAt: Date.now(),
+    identity: { userID: "test-user" },
+    servedModelIds: ids,
+    models: ids.map((id) => ({ id, name: id })),
+    configs: Object.fromEntries(ids.map((id) => [id, { key: id.toLowerCase(), enable: true, display_name: id }])),
+  });
+  writeFileSync(
+    accountCatalogPath(),
+    JSON.stringify({
+      version: 2,
+      updatedAt: Date.now(),
+      models: modelIds.map((id) => ({ id, name: id })),
+      configs,
+      accounts: {
+        "test-user": slot(servedModelIds),
+        // A second account in the region that does list the model: the
+        // entitlement veto only fires when the model exists elsewhere.
+        "other-user": slot(["Kimi-K3"]),
+      },
+    }),
+    "utf8",
+  );
+  clearQoderModelsMemCache();
+}
+
+function clearAccountCatalog(): void {
+  rmSync(accountCatalogPath(), { force: true });
+  clearQoderModelsMemCache();
+}
+
 function makeContext(): Context {
   return {
     systemPrompt: "test",
@@ -200,6 +252,33 @@ describe("streamQoder", () => {
       expect.stringMatching(/^https:\/\/gateway\.qoder\.com\.cn\//),
       expect.any(Object),
     );
+  });
+
+  it("fails fast when the account's own catalogue cannot serve the model", async () => {
+    writeAccountCatalog(["Lite"]);
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel("qoder", "Kimi-K3"), makeContext(), { apiKey: "fake" }));
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage } | undefined;
+    expect(err, "expected an entitlement error event").toBeDefined();
+    expect(err?.error.errorMessage).toMatch(/entitlement/i);
+    expect(err?.error.errorMessage).toMatch(/status 403/);
+    // Qoder only answers this after ~3 minutes, so it must never be attempted.
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    clearAccountCatalog();
+  });
+
+  it("still sends a model the account's own catalogue lists", async () => {
+    writeAccountCatalog(["Lite"]);
+    globalThis.fetch = mockFetch(SUCCESS_SSE);
+
+    await consume(streamQoder(makeModel("qoder", "Lite"), makeContext(), { apiKey: "fake" }));
+
+    expect(globalThis.fetch).toHaveBeenCalled();
+    clearAccountCatalog();
   });
 
   it("surfaces an upstream 406 'Session blocked' as an error event, not a silent stop", async () => {
