@@ -58,6 +58,26 @@ export function getContentImages(msg: Message): ImageContent[] {
   return msg.content.filter((c): c is ImageContent => c.type === "image");
 }
 
+export function extractTools(context: { tools?: Tool[]; messages?: Message[] }): Tool[] {
+  if (Array.isArray(context.tools) && context.tools.length > 0) {
+    return context.tools;
+  }
+
+  const tools = new Map<string, Tool>();
+  if (Array.isArray(context.messages)) {
+    for (const msg of context.messages) {
+      if ((msg as any).role !== "system") continue;
+      for (const tool of (msg as any).toolsRemoved ?? []) {
+        if (tool?.name) tools.delete(tool.name);
+      }
+      for (const tool of (msg as any).toolsAdded ?? []) {
+        if (tool?.name) tools.set(tool.name, tool);
+      }
+    }
+  }
+  return [...tools.values()];
+}
+
 export function transformTools(tools: Tool[]): QoderTool[] {
   return tools.map((t) => ({
     type: "function",

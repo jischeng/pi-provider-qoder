@@ -24,7 +24,8 @@ import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking.js";
-import { transformMessagesForQoder, transformTools } from "./transform.js";
+import { parseToolCallsFromText } from "./tool-parser.js";
+import { extractTools, transformMessagesForQoder, transformTools } from "./transform.js";
 
 interface ToolCallState {
   arguments: string;
@@ -389,7 +390,8 @@ export function streamQoder(
         maxTokens = options.maxTokens;
       }
 
-      const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
+      const effectiveTools = extractTools(context);
+      const toolsRaw = effectiveTools.length > 0 ? transformTools(effectiveTools) : undefined;
       const recordID = stableChatRecordID(qoderModel, finalMessages, toolsRaw, maxTokens);
 
       // Map pi's thinking level (options.reasoning) to Qoder's request fields.
@@ -841,6 +843,50 @@ export function streamQoder(
             },
             partial: output,
           });
+        }
+      }
+
+      // Fallback: If no native tool_calls were emitted, check if the model output
+      // XML/text <tool_call> tags in text blocks (e.g. Qwen / DeepSeek XML format).
+      if (!toolCallsState.some((state) => state?.emittedStart)) {
+        for (let i = 0; i < output.content.length; i++) {
+          const block = output.content[i];
+          if (block.type === "text" && block.text.includes("<tool_call>")) {
+            const { cleanText, toolCalls } = parseToolCallsFromText(block.text);
+            if (toolCalls.length > 0) {
+              block.text = cleanText;
+              for (const tc of toolCalls) {
+                const callId = `call_${crypto.randomUUID().slice(0, 8)}`;
+                const toolCallBlock: ToolCall = {
+                  type: "toolCall",
+                  id: callId,
+                  name: tc.name,
+                  arguments: tc.arguments,
+                };
+                const contentIndex = output.content.length;
+                output.content.push(toolCallBlock);
+                stream.push({
+                  type: "toolcall_start",
+                  contentIndex,
+                  partial: output,
+                });
+                stream.push({
+                  type: "toolcall_end",
+                  contentIndex,
+                  toolCall: toolCallBlock,
+                  partial: output,
+                });
+                toolCallsState.push({
+                  id: callId,
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.arguments),
+                  emittedStart: true,
+                  emittedEnd: true,
+                  contentIndex,
+                });
+              }
+            }
+          }
         }
       }
 

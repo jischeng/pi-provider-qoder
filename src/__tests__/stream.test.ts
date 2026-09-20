@@ -658,4 +658,33 @@ describe("streamQoder", () => {
     expect(parsed.parameters.enable_thinking).toBe(true);
     expect(["high", "max"]).toContain(parsed.parameters.reasoning_effort);
   });
+
+  it("parses XML <tool_call> tags from text stream as real tool calls", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          content:
+            "Let me read the file.\n\n<tool_call>\n<function=read>\n<parameter=file_path>/test/file.md</parameter>\n</function>\n</tool_call>",
+          role: "assistant",
+        }),
+      ) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = (done as { message: AssistantMessage }).message;
+
+    expect(msg.stopReason).toBe("toolUse");
+    const toolCall = msg.content.find((c) => c.type === "toolCall") as ToolCall | undefined;
+    expect(toolCall).toBeDefined();
+    expect(toolCall?.name).toBe("read");
+    expect(toolCall?.arguments.path).toBe("/test/file.md");
+
+    const text = msg.content.find((c) => c.type === "text") as { text: string } | undefined;
+    expect(text?.text).toBe("Let me read the file.");
+  });
 });
