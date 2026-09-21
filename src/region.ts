@@ -60,6 +60,24 @@ export function getQoderRegionConfig(mode: QoderMode): QoderRegionConfig {
   return QODER_REGIONS[mode];
 }
 
+/**
+ * Whether a pi provider id belongs to a region.
+ *
+ * A plain `startsWith(prefix + "-")` test is wrong here: the global prefix
+ * (`qoder`) is itself a prefix of the CN prefix (`qoder-cn`), so naive matching
+ * classifies `qoder-cn`/`qoder-cn-2` as global and sends CN tokens to the global
+ * API (401) or re-registers providers with the wrong region. Match the longest
+ * provider-id prefix instead.
+ */
+export function isProviderIDForMode(providerID: string, mode: QoderMode): boolean {
+  let match: QoderRegionConfig | undefined;
+  for (const region of Object.values(QODER_REGIONS)) {
+    if (providerID !== region.providerID && !providerID.startsWith(`${region.providerID}-`)) continue;
+    if (!match || region.providerID.length > match.providerID.length) match = region;
+  }
+  return match?.mode === mode;
+}
+
 export function getQoderBaseUrl(mode: QoderMode): string {
   return getQoderRegionConfig(mode).baseUrl;
 }

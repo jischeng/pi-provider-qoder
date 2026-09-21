@@ -20,7 +20,7 @@ import {
   updateQoderModelsCache,
 } from "./catalog.js";
 import { streamQoder } from "./protocol/stream.js";
-import { getQoderBaseUrl, getQoderRegionConfig, QODER_MODES, type QoderMode } from "./region.js";
+import { getQoderBaseUrl, getQoderRegionConfig, isProviderIDForMode, QODER_MODES, type QoderMode } from "./region.js";
 
 // pi supports a `fetchUsage` hook on the oauth config at runtime, but it is not
 // part of the published ProviderConfig type. Declare the extension locally.
@@ -31,6 +31,21 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
 type AccountLoginHandler = (providerID: string) => void;
 
 const MAX_QODER_ACCOUNTS = 10;
+
+/** Widget key + lifetime for the transient `/qoder-usage` readout. */
+const USAGE_WIDGET_KEY = "qoder-usage";
+const USAGE_WIDGET_TTL_MS = 15_000;
+let usageWidgetTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Drop a pending/visible usage readout. Safe to call from any UI context. */
+function clearUsageWidget(ctx: { ui: { setWidget: (key: string, content: undefined) => void } }): void {
+  if (usageWidgetTimer) {
+    clearTimeout(usageWidgetTimer);
+    usageWidgetTimer = undefined;
+  }
+  ctx.ui.setWidget(USAGE_WIDGET_KEY, undefined);
+}
+
 const registeredAccountProvidersByPi = new WeakMap<ExtensionAPI, Set<string>>();
 
 function getRegisteredAccountProviderIDs(pi: ExtensionAPI): Set<string> {
@@ -146,10 +161,9 @@ function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: 
 }
 
 function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
-  const prefix = getQoderRegionConfig(mode).providerID;
   const registeredAccountProviderIDs = getRegisteredAccountProviderIDs(pi);
   for (const providerID of registeredAccountProviderIDs) {
-    if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
+    if (isProviderIDForMode(providerID, mode)) {
       registerQoderProvider(pi, providerID, mode);
     }
   }
@@ -187,6 +201,47 @@ async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Pr
 
   const changed = await refreshAccountCatalogs(mode);
   if (changed) reRegisterProvidersForMode(pi, mode);
+}
+
+/** Collect usage lines for every Qoder account visible in this process. */
+async function collectQoderUsageLines(ctx: {
+  modelRegistry: { getApiKeyForProvider: (providerID: string) => Promise<string | undefined> };
+}): Promise<string[]> {
+  const lines: string[] = [];
+
+  for (const mode of QODER_MODES) {
+    const region = getQoderRegionConfig(mode);
+    const accounts = listQoderAccounts(mode);
+
+    if (accounts.length === 0) {
+      // Hosts that keep credentials outside auth.json (e.g. OMP) still expose
+      // the resolved token through the model registry.
+      try {
+        const token = await ctx.modelRegistry.getApiKeyForProvider(region.providerID);
+        if (token) {
+          const usage = await fetchQoderUsageForMode({ access: token } as OAuthCredentials, mode);
+          lines.push(`${region.usageTitle}: ${usage.summary || "usage unknown"}`);
+        }
+      } catch {
+        // Not logged in for this region; skip silently.
+      }
+      continue;
+    }
+
+    for (const account of accounts) {
+      try {
+        const usage = await fetchQoderUsageForMode({ access: account.access } as OAuthCredentials, mode);
+        const who = account.email || account.name || account.key;
+        const reset = usage.resetAt ? ` · resets ${usage.resetAt.slice(0, 10)}` : "";
+        lines.push(`${who} [${region.usageTitle}] — ${usage.summary || "usage unknown"}${reset}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        lines.push(`${account.email || account.key} [${region.usageTitle}] — failed: ${message}`);
+      }
+    }
+  }
+
+  return lines;
 }
 
 /**
@@ -281,6 +336,8 @@ export default async function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    // A readout scheduled by the previous session must not leak into this one.
+    clearUsageWidget(ctx);
     // Adopt whatever another pane wrote while this one was idle, then refresh
     // the accounts whose own slot is stale.
     reRegisterIfCatalogChanged();
@@ -307,7 +364,36 @@ export default async function (pi: ExtensionAPI) {
     reRegisterIfCatalogChanged();
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
+    clearUsageWidget(ctx);
     registeredAccountProvidersByPi.delete(pi);
   });
+
+  // Optional: hosts without interactive commands (OMP-style) simply skip it.
+  if (typeof pi.registerCommand === "function") {
+    pi.registerCommand("qoder-usage", {
+      description: "Show Qoder credit balance and quota usage",
+      handler: async (_args, ctx) => {
+        try {
+          const lines = await collectQoderUsageLines(ctx);
+          if (lines.length === 0) {
+            ctx.ui.notify("No logged-in Qoder account found. Use /login qoder or /login qoder-cn first.", "warning");
+            return;
+          }
+          // Transient by design: the readout self-clears so it never becomes a
+          // permanent fixture above the editor.
+          ctx.ui.setWidget(USAGE_WIDGET_KEY, lines, { placement: "aboveEditor" });
+          if (usageWidgetTimer) clearTimeout(usageWidgetTimer);
+          usageWidgetTimer = setTimeout(() => {
+            usageWidgetTimer = undefined;
+            ctx.ui.setWidget(USAGE_WIDGET_KEY, undefined);
+          }, USAGE_WIDGET_TTL_MS);
+          usageWidgetTimer.unref?.();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Failed to fetch Qoder usage: ${message}`, "error");
+        }
+      },
+    });
+  }
 }
