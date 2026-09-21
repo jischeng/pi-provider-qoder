@@ -12,9 +12,17 @@ export function parseToolCallsFromText(text: string): {
 
   let match: RegExpExecArray | null;
   while ((match = toolCallRegex.exec(text)) !== null) {
-    const rawContent = match[1].trim();
+    let rawContent = match[1].trim();
     let name = "";
     let args: Record<string, any> = {};
+
+    // Strip markdown code block fences if present (e.g. ```json ... ```)
+    if (rawContent.startsWith("```")) {
+      rawContent = rawContent
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/, "")
+        .trim();
+    }
 
     if (rawContent.startsWith("{") && rawContent.endsWith("}")) {
       try {
@@ -28,11 +36,13 @@ export function parseToolCallsFromText(text: string): {
         }
       } catch {}
     } else {
-      const funcMatch = /<function[=\s]+["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)(?:<\/function>|$)/i.exec(rawContent);
+      const funcMatch = /<function(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)(?:<\/function>|$)/i.exec(
+        rawContent,
+      );
       if (funcMatch) {
         name = funcMatch[1];
         const paramsBlock = funcMatch[2];
-        const paramRegex = /<parameter[=\s]+["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)<\/parameter>/gi;
+        const paramRegex = /<parameter(?:\s+name=|=|\s+)["']?([a-zA-Z0-9_\-]+)["']?>([\s\S]*?)<\/parameter>/gi;
         let pMatch: RegExpExecArray | null;
         while ((pMatch = paramRegex.exec(paramsBlock)) !== null) {
           const pName = pMatch[1];
