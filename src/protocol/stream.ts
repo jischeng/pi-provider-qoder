@@ -830,6 +830,12 @@ export function streamQoder(
       // Without this the body stays open until the server times it out.
       await reader.cancel().catch(() => {});
 
+      if (!sawDone) {
+        throw new Error(
+          `Qoder stream disconnected prematurely (connection closed before [DONE] after ${output.usage.output || 0} output tokens)`,
+        );
+      }
+
       if (thinkingParser) {
         thinkingParser.finalize();
       }
