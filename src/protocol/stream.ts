@@ -537,6 +537,7 @@ export function streamQoder(
             Accept: "text/event-stream",
             "Cache-Control": "no-cache",
             "Accept-Encoding": "identity",
+            Connection: "keep-alive",
             "X-Model-Key": qoderModel,
             "X-Model-Source": modelSource,
             ...headers,
