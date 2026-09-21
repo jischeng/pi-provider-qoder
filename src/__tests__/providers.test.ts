@@ -167,4 +167,30 @@ describe("qoder-api registry", () => {
     expect(typeof providers.get("qoder")?.streamSimple).toBe("function");
     expect(typeof providers.get("qoder-cn")?.streamSimple).toBe("function");
   });
+
+  it("re-registers providers for subsequent sessions (e.g. /resume, /new, switchSession)", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+
+    const { default: registerProviders } = await import("../index.js");
+
+    const providers1 = new Map<string, Record<string, unknown>>();
+    const pi1 = {
+      registerProvider: vi.fn((providerID: string, config: Record<string, unknown>) => {
+        providers1.set(providerID, config);
+      }),
+      on: vi.fn(),
+    };
+    await registerProviders(pi1 as never);
+    expect(providers1.has("qoder-cn")).toBe(true);
+
+    const providers2 = new Map<string, Record<string, unknown>>();
+    const pi2 = {
+      registerProvider: vi.fn((providerID: string, config: Record<string, unknown>) => {
+        providers2.set(providerID, config);
+      }),
+      on: vi.fn(),
+    };
+    await registerProviders(pi2 as never);
+    expect(providers2.has("qoder-cn")).toBe(true);
+  });
 });

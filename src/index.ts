@@ -31,7 +31,16 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
 type AccountLoginHandler = (providerID: string) => void;
 
 const MAX_QODER_ACCOUNTS = 10;
-const registeredAccountProviderIDs = new Set<string>();
+const registeredAccountProvidersByPi = new WeakMap<ExtensionAPI, Set<string>>();
+
+function getRegisteredAccountProviderIDs(pi: ExtensionAPI): Set<string> {
+  let ids = registeredAccountProvidersByPi.get(pi);
+  if (!ids) {
+    ids = new Set<string>();
+    registeredAccountProvidersByPi.set(pi, ids);
+  }
+  return ids;
+}
 
 const QODER_API = "qoder-api" as Api;
 
@@ -115,6 +124,7 @@ function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mo
 
   const providerID = accountProviderID(mode, accountNumber);
   const previousProviderID = accountProviderID(mode, accountNumber - 1);
+  const registeredAccountProviderIDs = getRegisteredAccountProviderIDs(pi);
   if (registeredAccountProviderIDs.has(providerID)) return;
   if (!getCachedCredentials("", previousProviderID)?.access) return;
 
@@ -126,6 +136,7 @@ function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mo
 
 function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: QoderMode): void {
   const providerID = accountProviderID(mode, accountNumber);
+  const registeredAccountProviderIDs = getRegisteredAccountProviderIDs(pi);
   if (registeredAccountProviderIDs.has(providerID)) return;
 
   registeredAccountProviderIDs.add(providerID);
@@ -136,6 +147,7 @@ function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: 
 
 function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
   const prefix = getQoderRegionConfig(mode).providerID;
+  const registeredAccountProviderIDs = getRegisteredAccountProviderIDs(pi);
   for (const providerID of registeredAccountProviderIDs) {
     if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
       registerQoderProvider(pi, providerID, mode);
@@ -293,5 +305,9 @@ export default async function (pi: ExtensionAPI) {
     // boundary. Doing this before a request could bypass the pool for that
     // request if handler ordering were reversed.
     reRegisterIfCatalogChanged();
+  });
+
+  pi.on("session_shutdown", () => {
+    registeredAccountProvidersByPi.delete(pi);
   });
 }
