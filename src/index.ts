@@ -31,7 +31,6 @@ type OAuthConfigWithUsage = NonNullable<ProviderConfig["oauth"]> & {
 type AccountLoginHandler = (providerID: string) => void;
 
 const MAX_QODER_ACCOUNTS = 10;
-const registeredAccountProviderIDs = new Set<string>();
 
 const QODER_API = "qoder-api" as Api;
 
@@ -110,72 +109,7 @@ function registerQoderProvider(
   });
 }
 
-function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: QoderMode): void {
-  if (accountNumber > MAX_QODER_ACCOUNTS) return;
 
-  const providerID = accountProviderID(mode, accountNumber);
-  const previousProviderID = accountProviderID(mode, accountNumber - 1);
-  if (registeredAccountProviderIDs.has(providerID)) return;
-  if (!getCachedCredentials("", previousProviderID)?.access) return;
-
-  registeredAccountProviderIDs.add(providerID);
-  registerQoderProvider(pi, providerID, mode, () => {
-    registerNextAccountProvider(pi, accountNumber + 1, mode);
-  });
-}
-
-function registerAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: QoderMode): void {
-  const providerID = accountProviderID(mode, accountNumber);
-  if (registeredAccountProviderIDs.has(providerID)) return;
-
-  registeredAccountProviderIDs.add(providerID);
-  registerQoderProvider(pi, providerID, mode, () => {
-    registerNextAccountProvider(pi, accountNumber + 1, mode);
-  });
-}
-
-function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
-  const prefix = getQoderRegionConfig(mode).providerID;
-  for (const providerID of registeredAccountProviderIDs) {
-    if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
-      registerQoderProvider(pi, providerID, mode);
-    }
-  }
-}
-
-async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Promise<void> {
-  for (let accountNumber = 1; accountNumber <= MAX_QODER_ACCOUNTS; accountNumber++) {
-    if (accountNumber > 1 && !getCachedCredentials("", accountProviderID(mode, accountNumber - 1))?.access) break;
-
-    const providerID = accountProviderID(mode, accountNumber);
-    try {
-      // PAT-based logins exchange the token and refresh the catalogue here;
-      // that path stays awaited so `pi --list-models` has data immediately.
-      await autoLoginQoderFromEnvironment(providerID, mode);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
-    }
-
-    registerAccountProvider(pi, accountNumber, mode);
-    if (!getCachedCredentials("", providerID)?.access) break;
-  }
-
-  // Register from whatever catalogue is already on disk, then refresh in the
-  // background. Blocking registration on a network round-trip delayed the
-  // provider (and therefore every qoder model) by seconds on slow networks.
-  if (hasCachedCatalog(mode)) {
-    void refreshAccountCatalogs(mode)
-      .then((changed) => {
-        if (changed) reRegisterProvidersForMode(pi, mode);
-      })
-      .catch(() => {});
-    return;
-  }
-
-  const changed = await refreshAccountCatalogs(mode);
-  if (changed) reRegisterProvidersForMode(pi, mode);
-}
 
 /**
  * Refresh the catalogue of every Qoder account known for a region.
@@ -244,10 +178,83 @@ async function refreshAccountFromRegistry(
 }
 
 export default async function (pi: ExtensionAPI) {
+  // MUST be instance-scoped: Node's ESM loader caches module records across Pi
+  // /reload cycles. A top-level Set survives reload, causing the guard below
+  // (`registeredAccountProviderIDs.has(id)`) to skip registering providers with
+  // the fresh ExtensionAPI instance, which wipes Qoder from Pi's model registry.
+  const registeredAccountProviderIDs = new Set<string>();
+
+  function registerNextAccountProvider(accountNumber: number, mode: QoderMode): void {
+    if (accountNumber > MAX_QODER_ACCOUNTS) return;
+
+    const providerID = accountProviderID(mode, accountNumber);
+    const previousProviderID = accountProviderID(mode, accountNumber - 1);
+    if (registeredAccountProviderIDs.has(providerID)) return;
+    if (!getCachedCredentials("", previousProviderID)?.access) return;
+
+    registeredAccountProviderIDs.add(providerID);
+    registerQoderProvider(pi, providerID, mode, () => {
+      registerNextAccountProvider(accountNumber + 1, mode);
+    });
+  }
+
+  function registerAccountProvider(accountNumber: number, mode: QoderMode): void {
+    const providerID = accountProviderID(mode, accountNumber);
+    if (registeredAccountProviderIDs.has(providerID)) return;
+
+    registeredAccountProviderIDs.add(providerID);
+    registerQoderProvider(pi, providerID, mode, () => {
+      registerNextAccountProvider(accountNumber + 1, mode);
+    });
+  }
+
+  function reRegisterProvidersForMode(mode: QoderMode): void {
+    const prefix = getQoderRegionConfig(mode).providerID;
+    for (const providerID of registeredAccountProviderIDs) {
+      if (providerID === prefix || providerID.startsWith(`${prefix}-`)) {
+        registerQoderProvider(pi, providerID, mode);
+      }
+    }
+  }
+
+  async function initializeAccountProviders(mode: QoderMode): Promise<void> {
+    for (let accountNumber = 1; accountNumber <= MAX_QODER_ACCOUNTS; accountNumber++) {
+      if (accountNumber > 1 && !getCachedCredentials("", accountProviderID(mode, accountNumber - 1))?.access) break;
+
+      const providerID = accountProviderID(mode, accountNumber);
+      try {
+        // PAT-based logins exchange the token and refresh the catalogue here;
+        // that path stays awaited so `pi --list-models` has data immediately.
+        await autoLoginQoderFromEnvironment(providerID, mode);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
+      }
+
+      registerAccountProvider(accountNumber, mode);
+      if (!getCachedCredentials("", providerID)?.access) break;
+    }
+
+    // Register from whatever catalogue is already on disk, then refresh in the
+    // background. Blocking registration on a network round-trip delayed the
+    // provider (and therefore every qoder model) by seconds on slow networks.
+    if (hasCachedCatalog(mode)) {
+      void refreshAccountCatalogs(mode)
+        .then((changed) => {
+          if (changed) reRegisterProvidersForMode(mode);
+        })
+        .catch(() => {});
+      return;
+    }
+
+    const changed = await refreshAccountCatalogs(mode);
+    if (changed) reRegisterProvidersForMode(mode);
+  }
+
   await registerQoderApi();
 
   for (const mode of QODER_MODES) {
-    await initializeAccountProviders(pi, mode);
+    await initializeAccountProviders(mode);
   }
 
   // Panes are separate processes sharing one catalogue file. Watch its
@@ -259,7 +266,7 @@ export default async function (pi: ExtensionAPI) {
       const signature = qoderCatalogCacheSignature(mode);
       if (knownSignatures.get(mode) === signature) continue;
       knownSignatures.set(mode, signature);
-      reRegisterProvidersForMode(pi, mode);
+      reRegisterProvidersForMode(mode);
     }
   };
   // Seed the signatures from the catalogue these registrations were built
@@ -278,7 +285,7 @@ export default async function (pi: ExtensionAPI) {
         if (listQoderAccounts(mode).length === 0) {
           changed = (await refreshAccountFromRegistry(mode, ctx)) || changed;
         }
-        if (changed) reRegisterProvidersForMode(pi, mode);
+        if (changed) reRegisterProvidersForMode(mode);
       } catch {
         // Best-effort: fall back to the existing cache / static models.
       }
