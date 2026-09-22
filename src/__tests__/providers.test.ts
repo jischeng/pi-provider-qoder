@@ -83,6 +83,36 @@ describe("provider region binding", () => {
     await cnOAuth.fetchUsage(credentials);
     expect(fetchMock).toHaveBeenLastCalledWith("https://openapi.qoder.com.cn/api/v2/quota/usage", expect.any(Object));
   });
+
+  it("re-registers providers across reload cycles with fresh pi instances", async () => {
+    for (const name of patEnvNames) delete process.env[name];
+    const { default: registerProviders } = await import("../index.js");
+
+    const createMockPi = () => {
+      const providers = new Map<string, Record<string, unknown>>();
+      return {
+        providers,
+        pi: {
+          registerProvider(providerID: string, config: Record<string, unknown>) {
+            providers.set(providerID, config);
+          },
+          on: vi.fn(),
+        },
+      };
+    };
+
+    const run1 = createMockPi();
+    await registerProviders(run1.pi as never);
+    expect(run1.providers.has("qoder")).toBe(true);
+    expect(run1.providers.has("qoder-cn")).toBe(true);
+
+    // Simulate Pi /reload: invoking the factory with a fresh ExtensionAPI instance
+    const run2 = createMockPi();
+    await registerProviders(run2.pi as never);
+    expect(run2.providers.has("qoder")).toBe(true);
+    expect(run2.providers.has("qoder-cn")).toBe(true);
+    expect(run2.providers.size).toBe(run1.providers.size);
+  });
 });
 
 describe("qoder-api registry", () => {
