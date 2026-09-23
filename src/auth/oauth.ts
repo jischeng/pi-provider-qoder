@@ -292,10 +292,10 @@ export async function resolveQoderIdentity(
   const region = getQoderRegionConfig(mode);
   const cacheKey = `${providerID}:${accessToken}`;
   const mem = identityCache.get(cacheKey);
-  if (mem?.userID) return mem;
+  if (mem?.userID && mem.userID !== "qoder-user") return mem;
 
   const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) {
+  if (cached?.userID && cached.userID !== "qoder-user") {
     identityCache.set(cacheKey, cached);
     return cached;
   }
