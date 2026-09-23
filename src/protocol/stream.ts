@@ -362,12 +362,17 @@ export function streamQoder(
       for (let i = finalMessages.length - 1; i >= 0; i--) {
         if (finalMessages[i].role === "user") {
           const content = finalMessages[i].content;
-          lastUserText =
+          const text =
             typeof content === "string"
               ? content
               : Array.isArray(content)
                 ? content.map((c) => ("text" in c ? c.text : "")).join("")
                 : "";
+          // Skip synthetic image carrier messages when resolving original user prompt
+          if (text.startsWith("[") && text.includes("image") && text.includes("returned by")) {
+            continue;
+          }
+          lastUserText = text;
           break;
         }
       }
@@ -532,6 +537,7 @@ export function streamQoder(
             Accept: "text/event-stream",
             "Cache-Control": "no-cache",
             "Accept-Encoding": "identity",
+            Connection: "keep-alive",
             "X-Model-Key": qoderModel,
             "X-Model-Source": modelSource,
             ...headers,
@@ -602,17 +608,19 @@ export function streamQoder(
               throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
             }
 
-            const innerStr = envelope.body;
-            // The gateway sends the sentinel wrapped in an envelope
-            // (`body: "[DONE]"`) as well as bare, and both mean the reply is
-            // over, so both have to end the read loop.
-            if (innerStr === "[DONE]") {
-              sawDone = true;
-              break;
+            let inner: Record<string, unknown> | null = null;
+            if (typeof envelope.body === "string") {
+              if (envelope.body === "[DONE]") {
+                sawDone = true;
+                break;
+              }
+              if (envelope.body) {
+                inner = JSON.parse(envelope.body);
+              }
+            } else if (envelope.choices || envelope.id) {
+              inner = envelope;
             }
-            if (!innerStr) continue;
-
-            const inner = JSON.parse(innerStr);
+            if (!inner) continue;
             if (inner.id) output.responseId = inner.id as string;
             // Keep Pi's selected model identity in `output.model`. Qoder may
             // report a different concrete backend route here; preserve that
@@ -647,8 +655,22 @@ export function streamQoder(
               output.usage.cacheRead = cacheReadTokens;
               output.usage.cacheWrite = cacheWriteTokens;
             }
-            if (inner.choices && inner.choices.length > 0) {
-              const choice = inner.choices[0];
+            const choices = inner.choices as
+              | Array<{
+                  delta?: {
+                    reasoning_content?: string;
+                    content?: string;
+                    tool_calls?: Array<{
+                      index?: number;
+                      id?: string;
+                      function?: { name?: string; arguments?: string };
+                    }>;
+                  };
+                  finish_reason?: string;
+                }>
+              | undefined;
+            if (Array.isArray(choices) && choices.length > 0) {
+              const choice = choices[0];
               const delta = choice.delta;
 
               if (delta) {
@@ -809,6 +831,12 @@ export function streamQoder(
       // Without this the body stays open until the server times it out.
       await reader.cancel().catch(() => {});
 
+      if (!sawDone) {
+        throw new Error(
+          `Qoder stream disconnected prematurely (connection closed before [DONE] after ${output.usage.output || 0} output tokens)`,
+        );
+      }
+
       if (thinkingParser) {
         thinkingParser.finalize();
       }
@@ -893,8 +921,12 @@ export function streamQoder(
       // Guarded on blocks that actually reached the message, not on the state
       // array being non-empty. Claiming "toolUse" for a message carrying no
       // tool call is what turned a malformed stream into a silent dead end.
+      // Never overwrite a terminal finish_reason ("length", "content_filter")
+      // because truncated tool calls are incomplete.
       if (toolCallsState.some((state) => state?.emittedStart)) {
-        output.stopReason = "toolUse";
+        if (output.stopReason !== "length") {
+          output.stopReason = "toolUse";
+        }
       }
       // Otherwise keep whatever finish_reason set upstream (defaults to "stop").
       // Never overwrite a meaningful finish_reason ("length", "content_filter",

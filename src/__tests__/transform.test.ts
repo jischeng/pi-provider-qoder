@@ -424,4 +424,93 @@ describe("transformMessagesForQoder", () => {
       if (tm.role === "tool") expect(declared.has(tm.tool_call_id as string)).toBe(true);
     }
   });
+
+  it("keeps parallel tool results contiguous when tool results contain images", () => {
+    // Regression: when multiple parallel tool calls return images (e.g. read screenshot files),
+    // interleaving a user image message between tool results broke the OpenAI requirement
+    // ("an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'").
+    const msgs = [
+      { role: "user", content: "inspect both screenshots" },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_img1", name: "read", arguments: { path: "a.png" } },
+          { type: "toolCall", id: "call_img2", name: "read", arguments: { path: "b.png" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_img1",
+        content: [
+          { type: "text", text: "image a" },
+          { type: "image", data: "base64_a", mimeType: "image/png" },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_img2",
+        content: [
+          { type: "text", text: "image b" },
+          { type: "image", data: "base64_b", mimeType: "image/png" },
+        ],
+      },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    // Sequence must be: user, assistant, tool, tool, user (images)
+    expect(result.map((m) => (m as { role: string }).role)).toEqual(["user", "assistant", "tool", "tool", "user"]);
+    const asst = result[1] as { tool_calls?: Array<{ id: string }> };
+    expect(asst.tool_calls?.map((t) => t.id)).toEqual(["call_img1", "call_img2"]);
+
+    const tool1 = result[2] as { role: string; tool_call_id: string };
+    const tool2 = result[3] as { role: string; tool_call_id: string };
+    expect(tool1.tool_call_id).toBe("call_img1");
+    expect(tool2.tool_call_id).toBe("call_img2");
+
+    const imgUser = result[4] as {
+      role: string;
+      content: Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    };
+    expect(imgUser.role).toBe("user");
+    expect(imgUser.content[0].text).toBe("[2 images returned by the previous tool calls]");
+    expect(imgUser.content[1].image_url?.url).toBe("data:image/png;base64,base64_a");
+    expect(imgUser.content[2].image_url?.url).toBe("data:image/png;base64,base64_b");
+  });
+
+  it("filters out abandoned/unanswered tool calls when a turn is interrupted", () => {
+    // If an assistant called two tools, but only one received a tool result before the user sent another message,
+    // the unresponded tool call must be dropped from assistant.tool_calls to prevent upstream 400.
+    const msgs = [
+      { role: "user", content: "run two things" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "running" },
+          { type: "toolCall", id: "call_finished", name: "read", arguments: {} },
+          { type: "toolCall", id: "call_unanswered", name: "read", arguments: {} },
+        ],
+      },
+      { role: "toolResult", toolCallId: "call_finished", content: "done" },
+      { role: "user", content: "stop, let us do something else" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => (m as { role: string }).role)).toEqual(["user", "assistant", "tool", "user"]);
+    const asst = result[1] as { tool_calls?: Array<{ id: string }> };
+    expect(asst.tool_calls?.map((t) => t.id)).toEqual(["call_finished"]);
+  });
+
+  it("drops assistant message when all tool calls were abandoned and assistant had no text", () => {
+    const msgs = [
+      { role: "user", content: "start" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_never_ran", name: "read", arguments: {} }],
+      },
+      { role: "user", content: "cancel" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result.map((m) => (m as { role: string }).role)).toEqual(["user", "user"]);
+  });
 });

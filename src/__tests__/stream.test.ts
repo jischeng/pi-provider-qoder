@@ -296,6 +296,22 @@ describe("streamQoder", () => {
     expect(events.find((e) => e.type === "done")).toBeUndefined();
   });
 
+  it("surfaces premature disconnect as an error when stream ends before [DONE]", async () => {
+    // If the server terminates the connection or times out without sending [DONE],
+    // it must surface as an error event, not be swallowed as a successful stop.
+    const truncatedSse = sseEnvelope(chunk({ content: "thinking...", role: "assistant" }));
+    globalThis.fetch = mockFetch(truncatedSse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.stopReason).toBe("error");
+    expect(msg.errorMessage).toMatch(/disconnected prematurely/i);
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
   it("preserves finish_reason=length instead of overwriting to stop", async () => {
     const sse =
       sseEnvelope(chunk({ content: "partial", role: "assistant" })) + sseEnvelope(finishChunk("length")) + DONE_SSE;

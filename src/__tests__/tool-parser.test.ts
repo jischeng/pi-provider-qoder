@@ -65,6 +65,34 @@ echo "hello world"
       config: { key: "value" },
     });
   });
+
+  it('parses XML style with name="..." attributes', () => {
+    const text = `<tool_call>
+<function name="read">
+<parameter name="file_path">/test/file.md</parameter>
+</function>
+</tool_call>`;
+
+    const { cleanText, toolCalls } = parseToolCallsFromText(text);
+    expect(cleanText).toBe("");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].name).toBe("read");
+    expect(toolCalls[0].arguments.path).toBe("/test/file.md");
+  });
+
+  it("parses markdown code blocks inside <tool_call>", () => {
+    const text = `<tool_call>
+\`\`\`json
+{"name": "read", "arguments": {"path": "/test/file.md"}}
+\`\`\`
+</tool_call>`;
+
+    const { cleanText, toolCalls } = parseToolCallsFromText(text);
+    expect(cleanText).toBe("");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].name).toBe("read");
+    expect(toolCalls[0].arguments).toEqual({ path: "/test/file.md" });
+  });
 });
 
 describe("extractTools", () => {

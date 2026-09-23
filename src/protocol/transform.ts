@@ -98,7 +98,9 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
   // with tool_calls".
   const droppedToolCallIds = new Set<string>();
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
     // Skip error or aborted messages
     if (
       msg.role === "assistant" &&
@@ -199,6 +201,36 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
         content = am.content || "";
       }
 
+      // Lookahead: only keep tool calls that will actually be followed by a
+      // tool result. Any declared tool_call that lacks a subsequent tool response
+      // triggers upstream 400 ("an assistant message with 'tool_calls' must be
+      // followed by tool messages responding to each 'tool_call_id'").
+      let validToolCalls = toolCalls;
+      if (toolCalls.length > 0 && i < messages.length - 1) {
+        const nextToolResultIds = new Set<string>();
+        let hasSubsequentTurn = false;
+        for (let k = i + 1; k < messages.length; k++) {
+          const nextMsg = messages[k];
+          if (nextMsg.role === "toolResult") {
+            const trId = (nextMsg as ToolResultMessage).toolCallId;
+            if (trId) nextToolResultIds.add(trId);
+          } else if ((nextMsg as any).role !== "system") {
+            hasSubsequentTurn = true;
+            break;
+          }
+        }
+
+        if (nextToolResultIds.size > 0 || hasSubsequentTurn) {
+          validToolCalls = toolCalls.filter((tc) => tc.id && nextToolResultIds.has(tc.id));
+          if (validToolCalls.length === 0 && !content.trim()) {
+            for (const tc of toolCalls) {
+              if (tc.id) droppedToolCallIds.add(tc.id);
+            }
+            continue;
+          }
+        }
+      }
+
       // Qoder's gateway drops assistant messages whose content is null, which
       // orphans the following tool_result and makes dmodel/ultimate upstreams
       // reject the request ("tool must follow a message with tool_calls").
@@ -206,19 +238,49 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       // single-space placeholder so the gateway keeps the message.
       const mapped: QoderMessage = {
         role: "assistant",
-        content: content || (toolCalls.length > 0 ? " " : null),
+        content: content || (validToolCalls.length > 0 ? " " : null),
       };
-      if (toolCalls.length > 0) {
-        mapped.tool_calls = toolCalls;
+      if (validToolCalls.length > 0) {
+        mapped.tool_calls = validToolCalls;
       }
       normalizedMessages.push(mapped);
     } else if (msg.role === "toolResult") {
-      const tr = msg as ToolResultMessage;
-      normalizedMessages.push({
-        role: "tool",
-        tool_call_id: tr.toolCallId,
-        content: getContentText(tr),
-      });
+      const prevMessage = normalizedMessages[normalizedMessages.length - 1];
+      const validDeclaredIds =
+        prevMessage?.role === "assistant" && prevMessage.tool_calls
+          ? new Set(prevMessage.tool_calls.map((tc) => tc.id).filter((id): id is string => !!id))
+          : null;
+
+      const collectedImages: ImageContent[] = [];
+      let toolCount = 0;
+
+      let j = i;
+      for (; j < messages.length && messages[j].role === "toolResult"; j++) {
+        const tr = messages[j] as ToolResultMessage;
+        if (droppedToolCallIds.has(tr.toolCallId)) {
+          continue;
+        }
+        if (validDeclaredIds && !validDeclaredIds.has(tr.toolCallId)) {
+          continue;
+        }
+
+        toolCount++;
+        const textResult = getContentText(tr);
+        const images = getContentImages(tr);
+        const toolContent = textResult || (images.length > 0 ? "(see attached image)" : "(no tool output)");
+
+        normalizedMessages.push({
+          role: "tool",
+          tool_call_id: tr.toolCallId,
+          content: toolContent,
+        });
+
+        if (images.length > 0) {
+          collectedImages.push(...images);
+        }
+      }
+
+      i = j - 1;
 
       // A tool result may carry images — pi's `read` tool returns a text note
       // plus an `image` block for png/jpg/gif/webp/bmp, and screenshot tools do
@@ -231,16 +293,20 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       // a plain string — so they follow as a separate user message, the same
       // shape the user branch above already builds. The leading label keeps the
       // model from reading a bare image as something the human just sent.
-      const images = getContentImages(tr);
-      if (images.length > 0) {
+      //
+      // All consecutive tool results are emitted first before any user image
+      // message is appended. Interleaving a user message between tool results
+      // violates the OpenAI requirement ("an assistant message with 'tool_calls'
+      // must be followed by tool messages responding to each 'tool_call_id'").
+      if (collectedImages.length > 0) {
         normalizedMessages.push({
           role: "user",
           content: [
             {
               type: "text",
-              text: `[${images.length} image${images.length === 1 ? "" : "s"} returned by the previous tool call]`,
+              text: `[${collectedImages.length} image${collectedImages.length === 1 ? "" : "s"} returned by the previous tool call${toolCount > 1 ? "s" : ""}]`,
             },
-            ...images.map(
+            ...collectedImages.map(
               (img): QoderImagePart => ({
                 type: "image_url",
                 image_url: { url: `data:${img.mimeType};base64,${img.data}` },
