@@ -6,7 +6,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import { qoderAccountKey, updateQoderModelsCache } from "../catalog.js";
 import { getMachineId } from "../cosy.js";
-import { getQoderRefreshURL, getQoderRegionConfig, type QoderMode } from "../region.js";
+import { getQoderRefreshURL, getQoderRegionConfig, isProviderIDForMode, type QoderMode } from "../region.js";
 import { interactiveLogin } from "./login.js";
 import { credentialsFromPat, decodePatRefresh, fetchUserInfo, isPatRefresh } from "./pat.js";
 
@@ -136,7 +136,7 @@ export function listQoderAccounts(mode: QoderMode): QoderAccountCredential[] {
 
   const auth = readAuthFileCached();
   for (const [providerID, credential] of Object.entries(auth ?? {})) {
-    if (providerID !== prefix && !providerID.startsWith(`${prefix}-`)) continue;
+    if (!isProviderIDForMode(providerID, mode)) continue;
     add(credential as Record<string, unknown>, providerID, "auth");
   }
 
@@ -292,10 +292,10 @@ export async function resolveQoderIdentity(
   const region = getQoderRegionConfig(mode);
   const cacheKey = `${providerID}:${accessToken}`;
   const mem = identityCache.get(cacheKey);
-  if (mem?.userID) return mem;
+  if (mem?.userID && mem.userID !== "qoder-user") return mem;
 
   const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) {
+  if (cached?.userID && cached.userID !== "qoder-user") {
     identityCache.set(cacheKey, cached);
     return cached;
   }

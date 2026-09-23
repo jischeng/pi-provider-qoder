@@ -91,6 +91,40 @@ describe("listQoderAccounts", () => {
     // CN credentials never leak into the global list.
     expect(listQoderAccounts("cn")).toEqual([]);
   });
+
+  it("does not treat a CN provider slot as a global account", () => {
+    // `qoder-cn` shares the `qoder-` prefix with global account slots, so a
+    // naive prefix match sent CN tokens to the global usage API (401) and
+    // re-registered CN providers with the global region.
+    writeFileSync(
+      AUTH_FILE,
+      JSON.stringify({
+        "qoder-cn": credential("user-cn", "token-cn"),
+        "qoder-cn-2": credential("user-cn2", "token-cn2"),
+      }),
+      "utf8",
+    );
+    clearQoderAuthMemCache();
+
+    expect(listQoderAccounts("global")).toEqual([]);
+    expect(
+      listQoderAccounts("cn")
+        .map((account) => account.key)
+        .sort(),
+    ).toEqual(["user-cn", "user-cn2"]);
+  });
+
+  it("keeps both regions separate when both are logged in", () => {
+    writeFileSync(
+      AUTH_FILE,
+      JSON.stringify({ qoder: credential("user-a", "token-a"), "qoder-cn": credential("user-cn", "token-cn") }),
+      "utf8",
+    );
+    clearQoderAuthMemCache();
+
+    expect(listQoderAccounts("global").map((account) => account.key)).toEqual(["user-a"]);
+    expect(listQoderAccounts("cn").map((account) => account.key)).toEqual(["user-cn"]);
+  });
 });
 
 describe("account catalogue refresh", () => {
