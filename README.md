@@ -75,6 +75,8 @@ pi --provider qoder-cn --model Qwen3.7-Plus
 | 用量查询 | `https://openapi.qoder.sh/api/v2/quota/usage` | `https://openapi.qoder.com.cn/api/v2/quota/usage` |
 | 聊天网关 | `https://api3.qoder.sh/` | `https://gateway.qoder.com.cn/` |
 
+实际对话网关会按账号从 `region/endpoints` 动态解析并优先路由到 `remote_agent` 节点（模型列表仍走上表推理节点），解析结果在 `~/.pi/agent/qoder-endpoints-cache.json` 中缓存 1 小时。若某个节点返回 `403 code 110 "Billing daily count exceeded"`，扩展会自动切换至候选节点重试并记住可用节点。
+
 ## Credits 扣费与账户配额展示
 
 底部状态栏可显示**会话实际扣除的 Credits**，从 Qoder 响应的 `usage.credits` 和 `usage.billable` 中累积。非计费请求计为 0。
@@ -104,6 +106,14 @@ pi --qoder-credit-footer
 ```bash
 npm run demo:credits
 ```
+
+### `omp usage` 用量视图
+
+OMP 的内置 `usage` 视图会读取 provider 级 `usage` 接口，登录后的 Qoder / Qoder CN 账号会以统一结构展示个人配额、加油包与企业资源包余额（读取失败仅展示为无数据，不会将正常凭据标为异常）。在 Pi 中请继续使用 `/qoder-usage`。
+
+## 版本更新提示
+
+扩展启动时会在后台非阻塞检查 npm 上 `@jischeng/pi-provider-qoder` 是否有新版本（超时 2s，失败静默，不自动安装），有新版本时打印单行升级提示。设置环境变量 `PI_PROVIDER_QODER_SKIP_UPDATE_CHECK=1` 可关闭该检查。
 
 ## License
 

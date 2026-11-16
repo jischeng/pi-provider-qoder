@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { qoderDecodeBody, qoderEncodeBody } from "../protocol/encoding.js";
 
@@ -119,5 +120,12 @@ describe("qoderEncodeBody", () => {
       const expected = Buffer.isBuffer(sample) ? sample : Buffer.from(sample);
       expect(decoded.equals(expected)).toBe(true);
     }
+  });
+
+  it("decodes a captured region/endpoints response", () => {
+    const fixture = JSON.parse(
+      readFileSync(new URL("../__fixtures__/region-endpoints.json", import.meta.url), "utf8"),
+    ) as { encoded: string; plaintext: string };
+    expect(qoderDecodeBody(fixture.encoded).toString("utf8")).toBe(fixture.plaintext);
   });
 });

@@ -1,3 +1,4 @@
+import type { Message, Tool } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { parseToolCallsFromText } from "../protocol/tool-parser.js";
 import { extractTools } from "../protocol/transform.js";
@@ -98,7 +99,7 @@ echo "hello world"
 describe("extractTools", () => {
   it("extracts from context.tools when present (Pi 0.85)", () => {
     const context = {
-      tools: [{ name: "read", description: "Read file", parameters: {} as any }],
+      tools: [{ name: "read", description: "Read file", parameters: {} as unknown as Tool["parameters"] }],
       messages: [],
     };
     const tools = extractTools(context);
@@ -113,16 +114,16 @@ describe("extractTools", () => {
           role: "system",
           content: "",
           toolsAdded: [
-            { name: "read", description: "Read file", parameters: {} as any },
-            { name: "bash", description: "Run bash", parameters: {} as any },
+            { name: "read", description: "Read file", parameters: {} as unknown as Tool["parameters"] },
+            { name: "bash", description: "Run bash", parameters: {} as unknown as Tool["parameters"] },
           ],
-        } as any,
+        } as unknown as Message,
         {
           role: "system",
           content: "",
           toolsRemoved: [{ name: "read" }],
-          toolsAdded: [{ name: "write", description: "Write file", parameters: {} as any }],
-        } as any,
+          toolsAdded: [{ name: "write", description: "Write file", parameters: {} as unknown as Tool["parameters"] }],
+        } as unknown as Message,
       ],
     };
     const tools = extractTools(context);

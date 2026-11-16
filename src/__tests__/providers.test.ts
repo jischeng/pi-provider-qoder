@@ -6,6 +6,10 @@ import { clearQoderAuthMemCache } from "../auth/oauth.js";
 import { clearQoderModelsMemCache } from "../catalog.js";
 import registerQoderExtension from "../index.js";
 
+// Registration imports the full pi-ai compat layer; under parallel workers
+// that can push these tests past vitest's 5s default.
+vi.setConfig({ testTimeout: 30_000 });
+
 const AGENT_DIR = join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent");
 const AUTH_FILE = join(AGENT_DIR, "auth.json");
 
@@ -30,16 +34,19 @@ function credential(userID: string, access: string) {
 interface FakePi {
   api: ExtensionAPI;
   registered: Map<string, number>;
+  configs: Map<string, Record<string, unknown>>;
   handlers: Map<string, Array<(...args: unknown[]) => unknown>>;
   emit(event: string): Promise<void>;
 }
 
 function makePi(): FakePi {
   const registered = new Map<string, number>();
+  const configs = new Map<string, Record<string, unknown>>();
   const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const api = {
-    registerProvider: (id: string) => {
+    registerProvider: (id: string, config: Record<string, unknown>) => {
       registered.set(id, (registered.get(id) ?? 0) + 1);
+      configs.set(id, config);
     },
     on: (event: string, handler: (...args: unknown[]) => unknown) => {
       const list = handlers.get(event) ?? [];
@@ -54,6 +61,7 @@ function makePi(): FakePi {
   return {
     api,
     registered,
+    configs,
     handlers,
     emit: async (event: string) => {
       for (const handler of handlers.get(event) ?? []) await handler({}, {});
@@ -61,7 +69,11 @@ function makePi(): FakePi {
   };
 }
 
+let prevSkipUpdateCheck: string | undefined;
+
 beforeEach(() => {
+  prevSkipUpdateCheck = process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK;
+  process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK = "1";
   clearQoderAuthMemCache();
   clearQoderModelsMemCache();
   mkdirSync(AGENT_DIR, { recursive: true });
@@ -98,6 +110,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (prevSkipUpdateCheck === undefined) delete process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK;
+  else process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK = prevSkipUpdateCheck;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   clearQoderAuthMemCache();
@@ -111,6 +125,11 @@ describe("provider registration across session lifecycles", () => {
 
     expect(pi.registered.get("qoder")).toBe(1);
     expect(pi.registered.get("qoder-cn")).toBe(1);
+    const qoderUsage = pi.configs.get("qoder")?.usage as
+      | { fetchUsage?: unknown; validatesCredentials?: boolean }
+      | undefined;
+    expect(typeof qoderUsage?.fetchUsage).toBe("function");
+    expect(qoderUsage?.validatesCredentials).toBe(false);
   });
 
   it("registers again for a replacement instance in the same process", async () => {

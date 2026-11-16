@@ -21,6 +21,14 @@ interface QoderTool {
   };
 }
 
+/** Pi >=0.86 transcript system entry with optional delta tool/section metadata. */
+interface TranscriptSystemEntry {
+  role?: string;
+  sections?: Record<string, unknown>;
+  toolsAdded?: Tool[];
+  toolsRemoved?: Array<{ name?: string }>;
+}
+
 /** OpenAI-style tool call within an assistant message. */
 interface QoderToolCall {
   id?: string;
@@ -72,11 +80,12 @@ export function extractTools(context: { tools?: Tool[]; messages?: Message[] }):
   const tools = new Map<string, Tool>();
   if (Array.isArray(context.messages)) {
     for (const msg of context.messages) {
-      if ((msg as any).role !== "system") continue;
-      for (const tool of (msg as any).toolsRemoved ?? []) {
+      const systemEntry = msg as unknown as TranscriptSystemEntry;
+      if (systemEntry.role !== "system") continue;
+      for (const tool of systemEntry.toolsRemoved ?? []) {
         if (tool?.name) tools.delete(tool.name);
       }
-      for (const tool of (msg as any).toolsAdded ?? []) {
+      for (const tool of systemEntry.toolsAdded ?? []) {
         if (tool?.name) tools.set(tool.name, tool);
       }
     }
@@ -131,9 +140,10 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       continue;
     }
 
-    if ((msg as any).role === "system") {
+    const systemEntry = msg as unknown as TranscriptSystemEntry;
+    if (systemEntry.role === "system") {
       let text = getContentText(msg);
-      const sections = (msg as any).sections;
+      const sections = systemEntry.sections;
       if (sections && typeof sections === "object") {
         const sectionTexts = Object.values(sections).filter(
           (s): s is string => typeof s === "string" && s.trim().length > 0,
@@ -224,7 +234,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           if (nextMsg.role === "toolResult") {
             const trId = (nextMsg as ToolResultMessage).toolCallId;
             if (trId) nextToolResultIds.add(trId);
-          } else if ((nextMsg as any).role !== "system") {
+          } else if ((nextMsg as unknown as TranscriptSystemEntry).role !== "system") {
             hasSubsequentTurn = true;
             break;
           }

@@ -25,7 +25,8 @@ import {
 } from "../catalog.js";
 import { buildAuthHeaders, getMachineId } from "../cosy.js";
 import { applyQoderCredits } from "../credits.js";
-import { getQoderChatURL, getQoderRegionConfig } from "../region.js";
+import { rememberChatBaseUrl, rotateChatEndpoint } from "../endpoints.js";
+import { getQoderChatBaseUrl, getQoderChatURL, getQoderRegionConfig } from "../region.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { isDegenerateDsmlTurn, stripDsmlResidue, stripThinkingTags, ThinkingTagParser } from "./thinking.js";
 import { parseToolCallsFromText } from "./tool-parser.js";
@@ -36,11 +37,39 @@ import { extractTools, transformMessagesForQoder, transformTools } from "./trans
  * client treats `isQueued:false` + `serviceAvailable:true` as "ready" and
  * re-sends the request after `retryAfterSeconds`; without that recovery one
  * transient rejection kills the whole turn. We mirror the bounded part of it.
+ *
+ * A real queue (`isQueued:true`) is NOT retried in-line: the wait can be
+ * minutes, and sleeping inside the stream would block the turn under the
+ * host's abort and retry policy. Instead the queued rejection is surfaced
+ * as a host-schedulable error carrying the queue fields and a
+ * `retry-after-ms=` hint, with no bare `403` in the text (a bare 403 is
+ * classified as an auth failure by the host and never retried).
  */
 const MODEL_BUSY_CODE = "10605";
 const DEFAULT_MODEL_BUSY_RETRIES = 2;
 const MAX_MODEL_BUSY_RETRIES = 10;
 const MODEL_BUSY_MAX_WAIT_MS = 5_000;
+
+/**
+ * Qoder tracks the daily chat allowance per node, so an account can exhaust it
+ * on one node while another node still serves the same account (this is what
+ * the official CLI avoids by routing agent chat to its remote-agent node).
+ * Code 110 is that rejection; it is recoverable only by switching nodes, never
+ * by re-sending to the same one.
+ */
+const DAILY_CHAT_LIMIT_CODE = "110";
+const MAX_CHAT_ENDPOINT_SWITCHES = 3;
+
+/** A "daily chat limit" rejection from one Qoder chat node. */
+export class QoderDailyChatLimitError extends Error {
+  constructor(
+    message: string,
+    readonly sawModelOutput = false,
+  ) {
+    super(message);
+    this.name = "QoderDailyChatLimitError";
+  }
+}
 
 /** A recovery-eligible "model busy" rejection from Qoder's queue scheduler. */
 class QoderModelBusyError extends Error {
@@ -54,9 +83,14 @@ class QoderModelBusyError extends Error {
   }
 }
 
-interface ModelBusyQueueSnapshot {
-  retryAfterMs?: number;
-}
+type ModelBusyQueueSnapshot =
+  | { kind: "ready"; retryAfterMs?: number }
+  | {
+      kind: "queued";
+      waitMs: number;
+      queueCount?: number;
+      queueType?: string;
+    };
 
 /** Parse `unknown | JSON string` layers until an object is found (bounded). */
 function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | undefined {
@@ -74,15 +108,32 @@ function parseJsonObject(value: unknown, depth = 0): Record<string, unknown> | u
 }
 
 /**
+ * Recognize Qoder's daily-chat-limit rejection. The gateway reports it as
+ * `{"code":"110","message":"Billing daily count exceeded"}` inside the envelope
+ * body (numeric `110` also appears in some builds).
+ */
+export function isDailyChatLimitRejection(body: unknown): boolean {
+  const root = parseJsonObject(body);
+  if (!root) return false;
+  const code = root.code;
+  return code === DAILY_CHAT_LIMIT_CODE || code === Number(DAILY_CHAT_LIMIT_CODE);
+}
+
+/**
  * Recognize Qoder's model-busy envelope and extract the retry hint.
  *
  * Envelope body shape (three nested JSON layers):
  *   {code:"403",message:"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":false,...}\",\"subCode\":\"RESOURCE_LIMIT\"}"}
  *
- * Only the documented 10605 code and the observed ready combination
- * (`isQueued:false` + `serviceAvailable:true`) are eligible. A real queue
- * (`isQueued:true`), missing flags, or any other code keep the previous
- * failure behavior. `subCode` is diagnostic only — it is not a retry signal.
+ * Only the documented 10605 code with `serviceAvailable:true` is eligible.
+ * `subCode` is diagnostic only — it is not a retry signal.
+ *
+ * - `isQueued:false` ("ready"): the caller may re-send after
+ *   `retryAfterSeconds`; the stream loop retries this in-line, bounded.
+ * - `isQueued:true` ("queued"): the request sits in a real queue. The
+ *   snapshot carries the server's `waitTime` (falling back to
+ *   `retryAfterSeconds` if absent) so the caller can surface it without
+ *   sleeping here.
  */
 export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot | undefined {
   const outer = parseJsonObject(body);
@@ -90,11 +141,40 @@ export function parseModelBusyRejection(body: unknown): ModelBusyQueueSnapshot |
   if (busy?.code !== MODEL_BUSY_CODE) return undefined;
   const queue = parseJsonObject(busy.message);
   if (!queue) return undefined;
-  if (queue.isQueued !== false || queue.serviceAvailable !== true) return undefined;
-  const seconds = queue.retryAfterSeconds;
-  const retryAfterMs =
-    typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : 0;
-  return { retryAfterMs };
+  if (queue.serviceAvailable !== true) return undefined;
+  const seconds = (value: unknown): number => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+    const milliseconds = Math.round(value * 1000);
+    return Number.isSafeInteger(milliseconds) && milliseconds > 0 ? milliseconds : 0;
+  };
+  if (queue.isQueued === false) {
+    return { kind: "ready", retryAfterMs: seconds(queue.retryAfterSeconds) };
+  }
+  if (queue.isQueued === true) {
+    const waitMs = seconds(queue.waitTime) || seconds(queue.retryAfterSeconds);
+    const queueCount = typeof queue.queueCount === "number" ? queue.queueCount : undefined;
+    const queueType = typeof queue.queueType === "string" ? queue.queueType : undefined;
+    return { kind: "queued", waitMs, queueCount, queueType };
+  }
+  return undefined;
+}
+
+/**
+ * Format a queued rejection for the host's retry machinery. The text
+ * deliberately contains no bare `403` (hosts classify that as an auth
+ * failure and never retry), includes a `retry-after-ms=` hint the host
+ * can schedule on, and stays retryable under pi-ai's retryable pattern
+ * via the truthful "rate limit" token (the queue is a CALL_COUNT_LIMIT
+ * throttle). Queue fields are included so a queued failure is
+ * distinguishable from an auth failure in logs and transcripts.
+ */
+export function formatQueuedBusyError(snapshot: Extract<ModelBusyQueueSnapshot, { kind: "queued" }>): Error {
+  const waitSeconds = Math.round(snapshot.waitMs / 1000);
+  const ahead = snapshot.queueCount !== undefined ? `, ${snapshot.queueCount} ahead` : "";
+  const tier = snapshot.queueType ? ` (${snapshot.queueType})` : "";
+  return new Error(
+    `Qoder model is busy: request queued (10605 CALL_COUNT_LIMIT${tier}${ahead}, ~${waitSeconds}s wait, rate limit, retry-after-ms=${snapshot.waitMs})`,
+  );
 }
 
 /** Sleep that rejects as soon as the caller aborts. */
@@ -178,8 +258,33 @@ function retireCompleteCandidates(toolCalls: ToolCallAggregation, candidates: To
 const TOOL_ARGUMENT_STRUCTURE = /["\\{}[\]]/g;
 const NON_JSON_WHITESPACE = /[^ \t\r\n]/;
 
+/**
+ * A tool call that cannot be turned into an executable call: arguments that
+ * never parse, or an identity that never arrived. When a payload was also
+ * dropped, the caller treats it as the transport failure it is; without one it
+ * stays the plain argument error it always was.
+ */
+class UnusableToolCallError extends Error {}
+
 function invalidToolArguments(state: ToolCallState): Error {
-  return new Error(`Invalid or incomplete tool-call JSON (characters=${state.argumentLength})`);
+  return new UnusableToolCallError(`Invalid or incomplete tool-call JSON (characters=${state.argumentLength})`);
+}
+
+/**
+ * Wording is load-bearing: pi-ai classifies assistant errors by message text,
+ * and `invalid` (in the plain argument error above) is an explicit
+ * non-retryable signal, while `server error` is a retryable one. A stream the
+ * gateway cut leaves nothing executable behind, so the host should replay the
+ * turn instead of ending the session.
+ *
+ * The message carries no diagnostic counts: a bare status-code-like token in
+ * it (for example, an argument length that happens to be 403) would let a
+ * host that vetoes bare 403 as an auth failure classify this retryable
+ * failure as non-retryable. Counts live only in the QODER_DEBUG log at the
+ * call site, never in the classified message.
+ */
+function lostToolArgumentStream(): Error {
+  return new Error("Qoder server error: tool-call argument stream was cut off (unparseable upstream payload)");
 }
 
 // Only locate a possible root-object boundary here. JSON.parse remains the
@@ -244,7 +349,7 @@ function parseToolArguments(state: ToolCallState): ToolCall["arguments"] {
     }
   }
   if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    throw new Error(`Non-object tool-call arguments (characters=${state.argumentLength})`);
+    throw new UnusableToolCallError(`Non-object tool-call arguments (characters=${state.argumentLength})`);
   }
   state.parsedArguments = args as ToolCall["arguments"];
   return state.parsedArguments;
@@ -466,6 +571,11 @@ export function streamQoder(
     stopReason: "stop",
     timestamp: Date.now(),
   };
+
+  // Unparseable upstream payloads dropped by the reader in the current attempt.
+  // Shared with the outer catch so every path that gives up on a tool call can
+  // tell a truncated stream from a genuinely bad call.
+  let droppedPayloads = 0;
 
   (async () => {
     try {
@@ -773,7 +883,10 @@ export function streamQoder(
         },
       };
 
-      const chatURL = getQoderChatURL(providerMode);
+      let chatURL = getQoderChatURL(providerMode);
+      const attemptedChatBases = new Set<string>();
+      let switchedChatEndpoint = false;
+      let chatEndpointSwitches = 0;
       const modelSource = modelConfig.source || "system";
 
       // A caller-provided retry budget (including an explicit 0) wins; otherwise
@@ -819,6 +932,7 @@ export function streamQoder(
         // error when the next attempt fails at fetch/HTTP level.
         options?.signal?.throwIfAborted();
         output.stopReason = "stop";
+        output.rawStopReason = undefined;
         output.errorMessage = undefined;
         output.responseId = undefined;
         output.responseModel = undefined;
@@ -853,6 +967,13 @@ export function streamQoder(
 
         if (!response.ok) {
           const errText = await response.text();
+          if (isDailyChatLimitRejection(errText)) {
+            // The same 110 rejection can also arrive as a plain HTTP error
+            // instead of an SSE envelope; rotate nodes for it the same way.
+            // The response headers just arrived, so no model output has been
+            // seen yet and the retry is safe.
+            throw new QoderDailyChatLimitError(`Upstream status ${response.status}: ${errText}`, false);
+          }
           throw new Error(`Qoder API request failed: ${response.status} ${response.statusText}. Response: ${errText}`);
         }
 
@@ -873,6 +994,11 @@ export function streamQoder(
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
         let sawModelOutput = false;
+        // A `data:` payload the gateway or a proxy cut in half is dropped below.
+        // Counted per attempt (declared outside): a dropped payload silently
+        // shortens tool-call arguments, and the turn must not die as an
+        // unrelated argument error.
+        droppedPayloads = 0;
 
         // `data: [DONE]` is the end of the response. Break the read loop too, not
         // just the line loop: Qoder's gateway keeps the HTTP body open after the
@@ -880,6 +1006,10 @@ export function streamQoder(
         // server or the OS eventually closed the socket. The full reply had
         // already been streamed by then, so the agent looked stuck with no error.
         let sawDone = false;
+        // fork: `smodel` (Sonus) ends cleanly after the finish chunk (`finish_reason`
+        // and/or `usage`) without ever sending `[DONE]`. Track the finish chunk
+        // so clean closes after a complete reply are not flagged as truncated.
+        let sawFinishChunk = false;
 
         try {
           while (!sawDone) {
@@ -909,14 +1039,34 @@ export function streamQoder(
                 break;
               }
 
+              // Which JSON the SyntaxError came from decides whether the line
+              // was noise (envelope) or lost model output (payload).
+              let parsePhase: "envelope" | "payload" = "envelope";
               try {
                 const envelope = JSON.parse(dataStr);
                 if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
                   const busy = parseModelBusyRejection(envelope.body);
-                  if (busy) {
+                  if (busy?.kind === "ready") {
                     throw new QoderModelBusyError(
                       `Upstream status ${envelope.statusCodeValue}: ${envelope.body}`,
                       busy.retryAfterMs,
+                      sawModelOutput,
+                    );
+                  }
+                  if (busy?.kind === "queued") {
+                    // A queued rejection that arrives after partial output
+                    // must not be host-retried: re-running the turn would
+                    // duplicate the content already emitted.
+                    if (sawModelOutput) {
+                      throw new Error("Qoder model rejected the request after partial output (10605 RESOURCE_LIMIT)");
+                    }
+                    throw formatQueuedBusyError(busy);
+                  }
+                  if (isDailyChatLimitRejection(envelope.body)) {
+                    // Another chat node may still serve this account; the
+                    // wrapper below switches and retries once per node.
+                    throw new QoderDailyChatLimitError(
+                      `Upstream status ${envelope.statusCodeValue}: ${envelope.body}`,
                       sawModelOutput,
                     );
                   }
@@ -933,10 +1083,12 @@ export function streamQoder(
                 }
                 if (!innerStr) continue;
 
+                parsePhase = "payload";
                 const inner = JSON.parse(innerStr);
                 if (inner.id) output.responseId = inner.id as string;
                 if (inner.model) output.responseModel = inner.model as string;
                 if (inner.usage) {
+                  sawFinishChunk = true;
                   // fork: pass the raw provider id — multi-account providers are
                   // `qoder-2` / `qoder-cn-2`, and applyQoderCredits normalizes
                   // them itself. Collapsing to a two-value enum here would tag
@@ -1188,9 +1340,15 @@ export function streamQoder(
                   }
 
                   if (choice.finish_reason) {
-                    // Preserve the real upstream finish_reason (e.g. "length",
-                    // "content_filter") instead of forcing "stop" later.
-                    output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
+                    sawFinishChunk = true;
+                    // fork: keep upstream finish_reason in rawStopReason and
+                    // keep stopReason inside pi's StopReason union
+                    // ("function_call" / "tool_calls" are mapped to "toolUse"
+                    // by the finalizer below only when a call reached output).
+                    output.rawStopReason = choice.finish_reason;
+                    if (choice.finish_reason === "length") {
+                      output.stopReason = "length";
+                    }
                   }
                 }
               } catch (e) {
@@ -1198,6 +1356,11 @@ export function streamQoder(
                 // But a genuine upstream error (thrown below) must propagate to the
                 // outer catch and surface as stopReason="error", not be swallowed.
                 if (e instanceof SyntaxError) {
+                  // An unparseable envelope is keepalive noise. An unparseable
+                  // payload is model output we will never see; it has to be
+                  // accounted for, or the turn ends as an unexplained
+                  // "invalid arguments" failure that no retry policy covers.
+                  if (parsePhase === "payload") droppedPayloads += 1;
                   if (process.env.QODER_DEBUG) {
                     console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
                   }
@@ -1221,8 +1384,9 @@ export function streamQoder(
         // finished turn, so the agent loop sees `stop` and never retries. Fail
         // loudly instead — pi-ai classifies this as a retryable provider error.
         // fork: surface a truncated stream as a retryable error instead of a
-        // silent stop; upstream has no such check.
-        if (!sawDone) {
+        // silent stop, unless the finish chunk already closed generation cleanly
+        // (smodel / Sonus ends without [DONE]).
+        if (!sawDone && !sawFinishChunk) {
           throw new Error(
             `Qoder stream disconnected prematurely (connection closed before [DONE] after ${output.usage.output || 0} output tokens)`,
           );
@@ -1247,8 +1411,12 @@ export function streamQoder(
           // Validate the whole batch before publishing any successful end event.
           for (const state of toolCalls.states) {
             if (!state.id || !state.name) {
-              throw new Error(`Unresolved tool-call identity (characters=${state.argumentLength})`);
+              throw new UnusableToolCallError(`Unresolved tool-call identity (characters=${state.argumentLength})`);
             }
+            // Validation only: the terminal classification happens once, in the
+            // stream's outer catch, so every site that gives up on a call — this
+            // loop, the identity check above, and the mid-stream argument
+            // accumulator — reports the same failure the same way.
             parseToolArguments(state);
           }
           // Map insertion order is the order calls first became identifiable,
@@ -1309,8 +1477,36 @@ export function streamQoder(
       for (let attempt = 0; ; attempt++) {
         try {
           await runAttempt();
+          if (switchedChatEndpoint) {
+            // Only persist a node that actually served a request; a node that
+            // failed again during rotation is never written.
+            rememberChatBaseUrl(providerMode, getQoderChatBaseUrl(providerMode));
+          }
           return;
         } catch (e) {
+          if (e instanceof QoderDailyChatLimitError) {
+            if (!e.sawModelOutput && chatEndpointSwitches < MAX_CHAT_ENDPOINT_SWITCHES) {
+              const nextBase = await rotateChatEndpoint(
+                providerMode,
+                { userID, authToken: accessToken, name, email, machineID },
+                attemptedChatBases,
+              );
+              if (nextBase) {
+                chatEndpointSwitches++;
+                switchedChatEndpoint = true;
+                chatURL = getQoderChatURL(providerMode);
+                headers = buildAuthHeaders(encodedBytes, chatURL, {
+                  userID,
+                  authToken: accessToken,
+                  name,
+                  email,
+                  machineID,
+                });
+                continue;
+              }
+            }
+            throw e;
+          }
           if (!(e instanceof QoderModelBusyError)) throw e;
           if (e.sawModelOutput || output.content.length > 0) {
             // Keep this wording out of pi-ai's retryable pattern: retrying a
@@ -1350,7 +1546,38 @@ export function streamQoder(
         }
       }
     } catch (e: unknown) {
-      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      const aborted = options?.signal?.aborted === true;
+      if (!aborted && droppedPayloads > 0 && e instanceof UnusableToolCallError) {
+        // Nothing executable has been published either way, so a lost payload is
+        // a transport failure whether or not the turn already streamed text. A
+        // host that replays a classified error drops the failed assistant turn
+        // from the context it re-sends (omp 18.x removes it as `auto-retry`), so
+        // streamed text neither vetoes the retry nor survives into it.
+        //
+        // The terminal message must not be `output` itself: toolcall_start/delta
+        // events already queued carry `partial: output`, and removing their
+        // blocks from it would leave event.partial.content[contentIndex]
+        // undefined. Publish a tool-call-free copy and leave `output` alone.
+        if (process.env.QODER_DEBUG) {
+          console.error(
+            `[pi-provider-qoder] lost tool-call argument stream: ${e.message}, droppedPayloads=${droppedPayloads}`,
+          );
+        }
+        const terminal: AssistantMessage = {
+          ...output,
+          content: output.content.filter((block) => block.type !== "toolCall"),
+          stopReason: "error",
+          errorMessage: lostToolArgumentStream().message,
+        };
+        stream.push({ type: "error", reason: "error", error: terminal });
+        try {
+          stream.end();
+        } catch {}
+        return;
+      }
+      // Cancellation outranks recovery: an aborted turn keeps `aborted`, never a
+      // retry-classified server error for a turn the user cancelled.
+      output.stopReason = aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       try {

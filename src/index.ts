@@ -1,3 +1,4 @@
+import { createRequire } from "node:module";
 import type { Api, Model, OAuthCredentials } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
@@ -20,8 +21,11 @@ import {
   updateQoderModelsCache,
 } from "./catalog.js";
 import { registerQoderCreditDisplay } from "./credit-display.js";
+import { applyCachedChatEndpoint, getCachedChatBaseUrl, refreshChatEndpoint } from "./endpoints.js";
 import { streamQoder } from "./protocol/stream.js";
 import { getQoderBaseUrl, getQoderRegionConfig, isProviderOfMode, QODER_MODES, type QoderMode } from "./region.js";
+import { checkForUpdate } from "./update-check.js";
+import { createQoderUsageProvider, type UsageProvider } from "./usage-provider.js";
 
 // pi supports a `fetchUsage` hook on the oauth config at runtime, but it is not
 // part of the published ProviderConfig type. Declare the extension locally.
@@ -63,6 +67,10 @@ function registeredProviderIDs(pi: ExtensionAPI): Set<string> {
 }
 
 const QODER_API = "qoder-api" as Api;
+
+// Version of the running extension, used by the startup update notice.
+const requirePackageJson = createRequire(import.meta.url);
+const CURRENT_VERSION: string = (requirePackageJson("../package.json") as { version?: string }).version ?? "0.0.0";
 
 async function registerQoderApi(): Promise<void> {
   try {
@@ -120,7 +128,9 @@ function registerQoderProvider(
   onLogin?: AccountLoginHandler,
 ): void {
   const oauth = createQoderOAuth(providerID, mode, onLogin);
-  pi.registerProvider(providerID, {
+  // `usage` is OMP's slot for `omp usage`; pi's published ProviderConfig has no
+  // such field, so the registered object is widened locally. pi ignores the key.
+  const config: ProviderConfig & { usage?: UsageProvider } = {
     name:
       providerID === "qoder-cn"
         ? "Qoder CN (Account 1)"
@@ -136,7 +146,9 @@ function registerQoderProvider(
     // pi-coding-agent resolves its own nested @earendil-works/pi-ai copy, so the
     // structurally identical Model/Context types are nominally distinct here.
     streamSimple: streamQoder as unknown as ProviderConfig["streamSimple"],
-  });
+    usage: createQoderUsageProvider(mode, providerID),
+  };
+  pi.registerProvider(providerID, config);
 }
 
 function registerNextAccountProvider(pi: ExtensionAPI, accountNumber: number, mode: QoderMode): void {
@@ -174,6 +186,10 @@ function reRegisterProvidersForMode(pi: ExtensionAPI, mode: QoderMode): void {
 }
 
 async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Promise<void> {
+  // Apply the node that served the last successful chat before registering,
+  // so the first turn after a restart does not repeat a failing route.
+  applyCachedChatEndpoint(mode);
+
   for (let accountNumber = 1; accountNumber <= MAX_QODER_ACCOUNTS; accountNumber++) {
     if (accountNumber > 1 && !getCachedCredentials("", accountProviderID(mode, accountNumber - 1))?.access) break;
 
@@ -189,6 +205,28 @@ async function initializeAccountProviders(pi: ExtensionAPI, mode: QoderMode): Pr
 
     registerAccountProvider(pi, accountNumber, mode);
     if (!getCachedCredentials("", providerID)?.access) break;
+  }
+
+  // fork: multi-account non-blocking endpoint discovery. Only query when no
+  // fresh node is cached and at least one non-expired account with a real
+  // identity exists (skipping expired/placeholder records such as synthetic
+  // offline harness entries with expires: 0).
+  if (!getCachedChatBaseUrl(mode)) {
+    const endpointAccount = listQoderAccounts(mode).find(
+      (a) =>
+        Boolean(a.access) &&
+        (a.expires === undefined || a.expires > Date.now()) &&
+        Boolean(a.userID) &&
+        a.userID !== "qoder-user",
+    );
+    if (endpointAccount) {
+      void refreshChatEndpoint(mode, {
+        userID: endpointAccount.userID,
+        authToken: endpointAccount.access,
+        name: endpointAccount.name,
+        email: endpointAccount.email,
+      }).catch(() => {});
+    }
   }
 
   // Register from whatever catalogue is already on disk, then refresh in the
@@ -275,6 +313,17 @@ async function refreshAccountFromRegistry(
 
 export default async function (pi: ExtensionAPI) {
   await registerQoderApi();
+
+  // npm-installed extensions get no update check from the host, so report a
+  // stale install once per start. Never awaited: registration must not wait on
+  // the network, and a failure here is uninteresting.
+  void checkForUpdate({
+    currentVersion: CURRENT_VERSION,
+    hostExecutable: process.argv[1],
+    disabled: process.env.PI_PROVIDER_QODER_SKIP_UPDATE_CHECK === "1",
+  }).then((notice) => {
+    if (notice) console.error(notice);
+  });
 
   for (const mode of QODER_MODES) {
     await initializeAccountProviders(pi, mode);

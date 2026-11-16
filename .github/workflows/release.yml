@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -13,6 +14,7 @@ permissions:
 jobs:
   publish:
     name: Build & publish to npm
+    if: github.event_name == 'workflow_dispatch' || vars.NPM_TRUSTED_PUBLISHING == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -47,6 +49,9 @@ jobs:
 
       - name: Type check
         run: npm run check
+
+      - name: Test
+        run: npm test
 
       - name: Build
         run: npm run build

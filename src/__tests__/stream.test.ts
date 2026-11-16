@@ -61,6 +61,24 @@ const DONE_SSE =
   }) +
   "\n\n";
 
+/**
+ * A well-formed envelope whose inner chunk is cut short — what a proxy or the
+ * gateway leaves behind when it truncates one upstream payload.
+ */
+function sseTruncatedPayload(body: object): string {
+  const envelope = JSON.parse(sseEnvelope(body).slice("data:".length).trim()) as {
+    headers: unknown;
+    body: string;
+    statusCodeValue: number;
+    statusCode: string;
+  };
+  return (
+    "data:" +
+    JSON.stringify({ ...envelope, body: envelope.body.slice(0, Math.max(1, envelope.body.length - 12)) }) +
+    "\n\n"
+  );
+}
+
 function chunk(delta: object, extra: object = {}): object {
   return {
     choices: [{ delta, index: 0 }],
@@ -480,6 +498,53 @@ describe("streamQoder", () => {
     expect(events.find((e) => e.type === "done")).toBeUndefined();
   });
 
+  it("completes a reply whose body ends with the finish chunk and no [DONE]", async () => {
+    // The `smodel` (Sonus) route never sends the [DONE] envelope: its body ends
+    // with the finish chunk, then `event:finish` and a clean close.
+    const sse = sseEnvelope(chunk({ content: "pong", role: "assistant" })) + sseEnvelope(finishChunk("stop"));
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage; reason: string };
+    expect(done.reason).toBe("stop");
+    expect(done.message.content).toEqual([{ type: "text", text: "pong" }]);
+  });
+
+  it("finalizes a tool call whose body ends with the finish chunk and no [DONE]", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          role: "assistant",
+          tool_calls: [{ index: 0, id: "fc_1", function: { name: "read" } }],
+        }),
+      ) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, function: { arguments: '{"path":"package' } }] })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, function: { arguments: '.json"}' } }] })) +
+      sseEnvelope(finishChunk("function_call"));
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage; reason: string };
+    expect(done.reason).toBe("toolUse");
+    expect(done.message.content).toEqual([
+      { type: "toolCall", id: "fc_1", name: "read", arguments: { path: "package.json" } },
+    ]);
+  });
+
+  it("never emits an out-of-union stopReason for Qoder's tool-call finish_reason", async () => {
+    const sse = sseEnvelope(chunk({ content: "done", role: "assistant" })) + sseEnvelope(finishChunk("function_call"));
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const done = events.find((e) => e.type === "done") as { message: AssistantMessage; reason: string };
+    expect(done.reason).toBe("stop");
+    expect(done.message.stopReason).toBe("stop");
+    expect(done.message.rawStopReason).toBe("function_call");
+  });
+
   it("surfaces an upstream 406 'Session blocked' as an error event, not a silent stop", async () => {
     globalThis.fetch = mockFetch(BLOCKED_SSE);
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
@@ -589,6 +654,231 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("toolUse");
     const toolCall = msg.content.find((c) => c.type === "toolCall");
     expect(toolCall).toBeDefined();
+  });
+
+  it("reports a lost upstream payload as a retryable turn, not a bad tool call", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"echo hello ' } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.errorMessage).toMatch(/server error/i);
+    expect(msg.errorMessage).not.toMatch(/invalid/i);
+    expect(PiAi.isRetryableAssistantError(msg)).toBe(true);
+    expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("keeps a 403-character lost payload retryable, with no bare 403 in the message", async () => {
+    const argument = '{"command":"echo hello '.padEnd(403, " ");
+    expect(argument.length).toBe(403);
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: argument } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.errorMessage).toMatch(/server error/i);
+    expect(msg.errorMessage).not.toMatch(/\b403\b/);
+    expect(PiAi.isRetryableAssistantError(msg)).toBe(true);
+    expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("does not invalidate queued tool-call partials when reporting a lost payload", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"echo hello ' } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const start = events.find((e) => e.type === "toolcall_start") as unknown as {
+      contentIndex: number;
+      partial: AssistantMessage;
+    };
+    expect(start, "expected a toolcall_start event").toBeDefined();
+    const queued = start.partial.content[start.contentIndex];
+    expect(queued?.type).toBe("toolCall");
+    expect((queued as ToolCall).id).toBe("call_1");
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage };
+    expect(err.error).not.toBe(start.partial);
+    expect(err.error.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(err.error.errorMessage).toMatch(/server error/i);
+  });
+
+  it("keeps the lost payload retryable after the turn already streamed text", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "派两个子代理并行。", role: "assistant" })) +
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"echo hello ' } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage };
+    expect(err, "expected an error event").toBeDefined();
+    expect(err.error.stopReason).toBe("error");
+    expect(err.error.errorMessage).toMatch(/server error/i);
+    expect(PiAi.isRetryableAssistantError(err.error)).toBe(true);
+    expect(err.error.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(err.error.content.find((c) => c.type === "text")).toBeDefined();
+  });
+
+  it("reports a lost payload as the retryable transport error when the tool-call identity never arrived", async () => {
+    const sse =
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, function: { arguments: '{"command":"echo hello ' } }] })) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage };
+    expect(err, "expected an error event").toBeDefined();
+    expect(err.error.errorMessage).toMatch(/server error/i);
+    expect(PiAi.isRetryableAssistantError(err.error)).toBe(true);
+    expect(err.error.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("reports a lost payload as the retryable transport error when junk arrives after the argument object closed", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "read", arguments: '{"command":"echo hi"}' } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world"}' } }] })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, function: { arguments: "xyz" } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage };
+    expect(err, "expected an error event").toBeDefined();
+    expect(err.error.errorMessage).toMatch(/server error/i);
+    expect(PiAi.isRetryableAssistantError(err.error)).toBe(true);
+    expect(err.error.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("reports a lost payload as the retryable transport error when a new call retires an unparseable one mid-stream", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "read", arguments: '{"a":}' } }] }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world"}' } }] })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_2", function: { name: "read", arguments: "" } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage };
+    expect(err, "expected an error event").toBeDefined();
+    expect(err.error.errorMessage).toMatch(/server error/i);
+    expect(PiAi.isRetryableAssistantError(err.error)).toBe(true);
+    expect(err.error.content.find((c) => c.type === "toolCall")).toBeUndefined();
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("reports aborted, not a retryable server error, when cancelled during cleanup after a lost payload", async () => {
+    const controller = new AbortController();
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":"echo hello ' } }],
+        }),
+      ) +
+      sseTruncatedPayload(chunk({ tool_calls: [{ index: 0, function: { arguments: 'world","i":"run"}' } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(sse);
+    let delivered = false;
+    const fakeReader = {
+      read: async () => {
+        if (!delivered) {
+          delivered = true;
+          return { done: false, value: encoded };
+        }
+        return { done: true, value: undefined };
+      },
+      cancel: async () => {
+        controller.abort();
+      },
+      releaseLock: () => {},
+    };
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      body: { getReader: () => fakeReader },
+    })) as unknown as typeof fetch;
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake", signal: controller.signal });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error") as { error: AssistantMessage; reason: string };
+    expect(err, "expected an error event").toBeDefined();
+    expect(err.error.stopReason).toBe("aborted");
+    expect(err.reason).toBe("aborted");
+    expect(PiAi.isRetryableAssistantError(err.error)).toBe(false);
+    expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("keeps the plain argument error when no payload was lost", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call_1", function: { name: "bash", arguments: '{"command":' } }],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.errorMessage).toMatch(/Invalid or incomplete tool-call JSON/);
   });
 
   it("assembles reasoning chunks before the final answer", async () => {

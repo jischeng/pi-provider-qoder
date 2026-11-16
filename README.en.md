@@ -75,6 +75,8 @@ After authenticating account 1, the next slot appears automatically:
 | Usage Quota | `https://openapi.qoder.sh/api/v2/quota/usage` | `https://openapi.qoder.com.cn/api/v2/quota/usage` |
 | Chat Gateway | `https://api3.qoder.sh/` | `https://gateway.qoder.com.cn/` |
 
+Agent chat dynamically resolves per-account endpoints from `region/endpoints` and prefers the `remote_agent` node (keeping `/model/list` on the inference node), caching the resolved chat base URL for 1 hour in `~/.pi/agent/qoder-endpoints-cache.json`. On `403 code 110 "Billing daily count exceeded"`, the extension rotates to the next candidate node, retries, and remembers the serving node.
+
 ## Request and Account Credits
 
 The footer displays **actual session deductions in Credits**, aggregated from response `usage.credits` and `usage.billable`. Non-billable requests contribute 0.
@@ -104,6 +106,14 @@ Enabling this replaces the misleading `$0.000 (sub)` cost footer with labelled s
 ```bash
 npm run demo:credits
 ```
+
+### `omp usage` Integration
+
+OMP's built-in `usage` view reads the provider-level `usage` slot so logged-in Qoder accounts display personal, add-on, and active organization credit buckets (`validatesCredentials: false`, so failed quota reads never mark healthy credentials unhealthy). In Pi, `/qoder-usage` remains the primary quota command.
+
+## Startup Update Check
+
+At startup the extension performs a best-effort, non-blocking check against npm for newer releases of `@jischeng/pi-provider-qoder` (2s timeout, silent on failure) and logs a one-line upgrade hint when a newer version is published. Set `PI_PROVIDER_QODER_SKIP_UPDATE_CHECK=1` to disable.
 
 ## License
 
