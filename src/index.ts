@@ -258,7 +258,7 @@ async function refreshAccountFromRegistry(
   if (!accessToken) return false;
 
   const credentials = getCachedCredentials(accessToken, providerID);
-  if (!credentials?.userID) return false;
+  if (!credentials?.userID || credentials.userID === "qoder-user") return false;
 
   const key = qoderAccountKey({ userID: credentials.userID, email: credentials.email });
   if (!isAccountCatalogStale(mode, key)) return false;

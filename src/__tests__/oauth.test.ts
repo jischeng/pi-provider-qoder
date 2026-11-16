@@ -7,8 +7,9 @@ import {
   clearQoderAuthMemCache,
   getCachedCredentials,
   getQoderPatForMode,
+  resolveQoderIdentity,
 } from "../auth/oauth.js";
-import { credentialsFromPat } from "../auth/pat.js";
+import { credentialsFromPat, fetchUserInfo } from "../auth/pat.js";
 import { updateQoderModelsCache } from "../catalog.js";
 import { loadLiveFixture } from "./live-fixture.js";
 
@@ -42,6 +43,8 @@ vi.mock("../auth/pat.js", () => ({
   }),
   isPatRefresh: vi.fn().mockReturnValue(false),
   decodePatRefresh: vi.fn(),
+  fetchUserInfo: vi.fn(),
+  authFetchSignal: vi.fn(),
 }));
 
 vi.mock("../catalog.js", () => ({
@@ -163,5 +166,85 @@ describe("oauth autoLoginQoderFromEnvironment", () => {
       identity.email,
       "global",
     );
+  });
+});
+
+describe("resolveQoderIdentity", () => {
+  const originalEnv = process.env;
+  let originalAuth: string | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env = { ...originalEnv };
+    clearPatEnv();
+    clearQoderAuthMemCache();
+    originalAuth = existsSync(AUTH_FILE) ? readFileSync(AUTH_FILE, "utf8") : undefined;
+    rmSync(AUTH_FILE, { force: true });
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    if (originalAuth === undefined) rmSync(AUTH_FILE, { force: true });
+    else writeFileSync(AUTH_FILE, originalAuth, "utf8");
+    clearQoderAuthMemCache();
+  });
+
+  it("does not cache or persist fallback qoder-user identity on transient userinfo failure", async () => {
+    vi.mocked(fetchUserInfo)
+      .mockResolvedValueOnce({ userID: "", email: "", name: "" })
+      .mockResolvedValueOnce({ userID: "real-uid", email: "u@example.com", name: "User" });
+
+    const first = await resolveQoderIdentity("tok-transient", "qoder-cn", "cn");
+    expect(first.userID).toBe("qoder-user");
+    expect(existsSync(AUTH_FILE)).toBe(false);
+
+    const second = await resolveQoderIdentity("tok-transient", "qoder-cn", "cn");
+    expect(second.userID).toBe("real-uid");
+    expect(second.email).toBe("u@example.com");
+    expect(second.name).toBe("User");
+    expect(fetchUserInfo).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores cached qoder-user placeholder in auth.json and preserves refresh and expires on update", async () => {
+    writeFileSync(
+      AUTH_FILE,
+      JSON.stringify({
+        qoder: {
+          type: "oauth",
+          access: "tok-1",
+          refresh: "pat|pt-1|jrt| |m",
+          expires: 1900000000000,
+          userID: "qoder-user",
+        },
+      }),
+      "utf8",
+    );
+    clearQoderAuthMemCache();
+    vi.mocked(fetchUserInfo).mockResolvedValueOnce({
+      userID: "cn-uid",
+      email: "cn@example.com",
+      name: "CN",
+    });
+
+    const resolved = await resolveQoderIdentity("tok-1", "qoder", "cn");
+    expect(resolved).toMatchObject({
+      access: "tok-1",
+      userID: "cn-uid",
+      email: "cn@example.com",
+      name: "CN",
+      refresh: "pat|pt-1|jrt| |m",
+      expires: 1900000000000,
+    });
+    expect(fetchUserInfo).toHaveBeenCalledTimes(1);
+
+    const saved = JSON.parse(readFileSync(AUTH_FILE, "utf8")) as Record<string, Record<string, unknown>>;
+    expect(saved.qoder).toMatchObject({
+      access: "tok-1",
+      userID: "cn-uid",
+      email: "cn@example.com",
+      name: "CN",
+      refresh: "pat|pt-1|jrt| |m",
+      expires: 1900000000000,
+    });
   });
 });

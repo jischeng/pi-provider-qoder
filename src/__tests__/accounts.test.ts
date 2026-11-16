@@ -122,6 +122,25 @@ describe("listQoderAccounts", () => {
         .sort(),
     ).toEqual(["qoder-cn", "qoder-cn-2"]);
   });
+
+  it("does not treat a CN provider slot as a global account", () => {
+    writeFileSync(
+      AUTH_FILE,
+      JSON.stringify({
+        "qoder-cn": credential("user-cn", "token-cn"),
+        "qoder-cn-2": credential("user-cn2", "token-cn2"),
+      }),
+      "utf8",
+    );
+    clearQoderAuthMemCache();
+
+    expect(listQoderAccounts("global")).toEqual([]);
+    expect(
+      listQoderAccounts("cn")
+        .map((account) => account.key)
+        .sort(),
+    ).toEqual(["user-cn", "user-cn2"]);
+  });
 });
 
 describe("account catalogue refresh", () => {

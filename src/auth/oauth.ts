@@ -257,14 +257,14 @@ export async function autoLoginQoderFromEnvironment(providerID: string, mode: Qo
 export function getCachedCredentials(accessToken?: string, providerID = "qoder"): QoderCredentials | null {
   if (accessToken) {
     const mem = identityCache.get(`${providerID}:${accessToken}`);
-    if (mem?.userID) return mem;
+    if (mem?.userID && mem.userID !== "qoder-user") return mem;
   }
 
   const auth = readAuthFileCached();
   if (auth) {
     const creds = (auth[providerID] || (providerID === "qoder" ? auth.qoder : null)) as QoderCredentials | null;
     if (creds?.userID || creds?.access) {
-      if (creds.access && creds.userID) {
+      if (creds.access && creds.userID && creds.userID !== "qoder-user") {
         identityCache.set(`${providerID}:${creds.access}`, creds);
       }
       if (!accessToken || creds.access === accessToken) {
@@ -275,7 +275,7 @@ export function getCachedCredentials(accessToken?: string, providerID = "qoder")
 
   const multiCreds = readMultiAuthCredentials(accessToken, providerID);
   if (multiCreds) {
-    if (multiCreds.access && multiCreds.userID) {
+    if (multiCreds.access && multiCreds.userID && multiCreds.userID !== "qoder-user") {
       identityCache.set(`${providerID}:${multiCreds.access}`, multiCreds);
     }
     return multiCreds;
@@ -292,34 +292,39 @@ export async function resolveQoderIdentity(
   const region = getQoderRegionConfig(mode);
   const cacheKey = `${providerID}:${accessToken}`;
   const mem = identityCache.get(cacheKey);
-  if (mem?.userID) return mem;
+  if (mem?.userID && mem.userID !== "qoder-user") return mem;
 
   const cached = getCachedCredentials(accessToken, providerID);
-  if (cached?.userID) {
+  if (cached?.userID && cached.userID !== "qoder-user") {
     identityCache.set(cacheKey, cached);
     return cached;
   }
 
   const info = await fetchUserInfo(accessToken, mode);
-  const machineID = getMachineId();
-  const creds: QoderCredentials = {
-    access: accessToken,
-    userID: info.userID || "qoder-user",
-    email: info.email || region.userEmailFallback,
-    name: info.name || region.userNameFallback,
-    machineID,
-    refresh: "",
-    expires: 0,
-  };
-  identityCache.set(cacheKey, creds);
-
-  // Only persist to auth.json if the entry matches this account or there is no
-  // other valid account stored, avoiding clobbering main account credentials.
+  const machineID = cached?.machineID || getMachineId();
   const existing = readAuthFileCached();
   const currentSaved = (existing?.[providerID] ||
     (providerID === "qoder" ? existing?.qoder : null)) as QoderCredentials | null;
-  if (!currentSaved || currentSaved.access === accessToken) {
-    saveCredentialsToAuthFile(providerID, creds);
+  const sameSavedAccount = currentSaved?.access === accessToken ? currentSaved : null;
+
+  const creds: QoderCredentials = {
+    access: accessToken,
+    userID: info.userID || "qoder-user",
+    email: info.email || sameSavedAccount?.email || region.userEmailFallback,
+    name: info.name || sameSavedAccount?.name || region.userNameFallback,
+    machineID,
+    refresh: sameSavedAccount?.refresh || "",
+    expires: sameSavedAccount?.expires || 0,
+  };
+
+  // Never cache or persist the "qoder-user" placeholder: a transient
+  // /userinfo failure would otherwise poison auth.json and make Qoder CN
+  // reject every subsequent request with 403/105 "Login expired".
+  if (info.userID && info.userID !== "qoder-user") {
+    identityCache.set(cacheKey, creds);
+    if (!currentSaved || currentSaved.access === accessToken) {
+      saveCredentialsToAuthFile(providerID, creds);
+    }
   }
 
   return creds;

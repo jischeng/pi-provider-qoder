@@ -110,6 +110,7 @@ describe("provider registration across session lifecycles", () => {
     await registerQoderExtension(pi.api);
 
     expect(pi.registered.get("qoder")).toBe(1);
+    expect(pi.registered.get("qoder-cn")).toBe(1);
   });
 
   it("registers again for a replacement instance in the same process", async () => {
@@ -121,11 +122,13 @@ describe("provider registration across session lifecycles", () => {
     const first = makePi();
     await registerQoderExtension(first.api);
     expect(first.registered.get("qoder")).toBe(1);
+    expect(first.registered.get("qoder-cn")).toBe(1);
 
     const second = makePi();
     await registerQoderExtension(second.api);
 
     expect(second.registered.get("qoder")).toBe(1);
+    expect(second.registered.get("qoder-cn")).toBe(1);
   });
 
   it("does not double-register within one instance", async () => {

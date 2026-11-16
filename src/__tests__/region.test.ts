@@ -8,6 +8,7 @@ import {
   getQoderRegionConfig,
   getQoderUsageURL,
   getQoderUserInfoURL,
+  isProviderOfMode,
   QODER_MODES,
 } from "../region.js";
 
@@ -36,5 +37,33 @@ describe("Qoder regions", () => {
     expect(getQoderUserInfoURL("cn")).toBe("https://openapi.qoder.com.cn/api/v1/userinfo");
     expect(getQoderUsageURL("cn")).toBe("https://openapi.qoder.com.cn/api/v2/quota/usage");
     expect(getQoderRefreshURL("cn")).toBe("https://gateway.qoder.com.cn/algo/api/v3/user/refresh_token");
+  });
+});
+
+describe("isProviderOfMode", () => {
+  it("binds each provider id to exactly one region", () => {
+    expect(isProviderOfMode("qoder", "global")).toBe(true);
+    expect(isProviderOfMode("qoder", "cn")).toBe(false);
+    expect(isProviderOfMode("qoder-cn", "cn")).toBe(true);
+    expect(isProviderOfMode("qoder-cn", "global")).toBe(false);
+  });
+
+  it("keeps numbered account slots in their own region", () => {
+    expect(isProviderOfMode("qoder-2", "global")).toBe(true);
+    expect(isProviderOfMode("qoder-2", "cn")).toBe(false);
+    expect(isProviderOfMode("qoder-cn-2", "cn")).toBe(true);
+    // The global prefix is itself a prefix of the CN prefix, so `qoder-cn-2`
+    // must not be claimed by the global region.
+    expect(isProviderOfMode("qoder-cn-2", "global")).toBe(false);
+  });
+
+  it("rejects unrelated, lookalike, or missing ids", () => {
+    expect(isProviderOfMode(undefined, "global")).toBe(false);
+    expect(isProviderOfMode(undefined, "cn")).toBe(false);
+    expect(isProviderOfMode("openai", "global")).toBe(false);
+    expect(isProviderOfMode("qoderx", "global")).toBe(false);
+    expect(isProviderOfMode("qoderx", "cn")).toBe(false);
+    expect(isProviderOfMode("qoder-work", "global")).toBe(true);
+    expect(isProviderOfMode("qoder-work", "cn")).toBe(false);
   });
 });

@@ -60,7 +60,10 @@ export function normalizeQoderQuotaSnapshot(value: unknown): QoderQuotaSnapshot 
   const userQuota = normalizeBucket(raw.userQuota);
   const addOnQuota = normalizeBucket(raw.addOnQuota);
   const orgRaw = asRecord(raw.orgResourcePackage);
-  const orgResourcePackage = normalizeBucket(orgRaw, orgRaw && "cap" in orgRaw ? "cap" : "total");
+  // Qoder CN reports `available: false` on orgResourcePackage when the account
+  // has no usable organization package; omit it instead of rendering an empty/exhausted bucket.
+  const orgResourcePackage =
+    orgRaw?.available === false ? undefined : normalizeBucket(orgRaw, orgRaw && "cap" in orgRaw ? "cap" : "total");
   if (!userQuota && !addOnQuota && !orgResourcePackage) return undefined;
   const expiration = quotaNumber(raw.expiresAt);
   // Qoder's existing provider contract uses Unix milliseconds. Do not guess a

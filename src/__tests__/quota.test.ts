@@ -76,6 +76,21 @@ describe("quota normalization", () => {
       normalizeQoderQuotaSnapshot({ addOnQuota: { remaining: 100, unit: "credits" } })?.addOnQuota?.remaining,
     ).toBe(100);
   });
+
+  it("keeps available org packages with cap and omits unavailable org packages", () => {
+    const active = normalizeQoderQuotaSnapshot({
+      userQuota: { total: 3000, used: 258, remaining: 2742, unit: "credits" },
+      orgResourcePackage: { cap: 500, used: 0, remaining: 500, available: true, unit: "credits" },
+    });
+    expect(active?.orgResourcePackage).toEqual({ total: 500, used: 0, remaining: 500, unit: "credits" });
+
+    const inactive = normalizeQoderQuotaSnapshot({
+      userQuota: { total: 3000, used: 258, remaining: 2742, unit: "credits" },
+      orgResourcePackage: { cap: 500, used: 500, remaining: 0, available: false, unit: "credits" },
+    });
+    expect(inactive?.userQuota?.remaining).toBe(2742);
+    expect(inactive?.orgResourcePackage).toBeUndefined();
+  });
   it("preserves separate account buckets without aggregating different units", () => {
     expect(normalizeQoderQuotaSnapshot(completeRaw)).toEqual({
       userQuota: { total: 100, used: 25, remaining: 75, unit: "credits" },
@@ -235,6 +250,42 @@ describe("provider usage compatibility", () => {
       vi.fn().mockResolvedValue(new Response("secret-body", { status: 401, statusText: "secret-text" })),
     );
     await expect(fetchQoderUsageForMode(credentials, "global")).rejects.toThrow("Failed to fetch Qoder usage (401)");
+  });
+
+  it("omits unavailable org resource packages from usageBuckets and keeps available cap packages", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              userQuota: { total: 3000, used: 258, remaining: 2742, unit: "credits" },
+              orgResourcePackage: { cap: 500, used: 500, remaining: 0, available: false, unit: "credits" },
+            }),
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              userQuota: { total: 3000, used: 258, remaining: 2742, unit: "credits" },
+              orgResourcePackage: { cap: 500, used: 0, remaining: 500, available: true, unit: "credits" },
+            }),
+          ),
+        ),
+    );
+
+    const withoutOrg = await fetchQoderUsageForMode(credentials, "cn");
+    expect(withoutOrg.usageBuckets?.map((bucket) => bucket.id)).toEqual(["user-quota"]);
+
+    const withOrg = await fetchQoderUsageForMode(credentials, "cn");
+    expect(withOrg.usageBuckets?.map((bucket) => bucket.id)).toEqual(["user-quota", "org-resource-package"]);
+    expect(withOrg.usageBuckets?.find((bucket) => bucket.id === "org-resource-package")).toMatchObject({
+      label: "Org Resource Package",
+      usedDisplay: "0.00",
+      limitDisplay: "500.00",
+      unit: "credits",
+    });
   });
 });
 
